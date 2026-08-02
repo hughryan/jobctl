@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>jobctl</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #fff; color: #111; }
+  @media (prefers-color-scheme: dark) { body { background: #1a1a1a; color: #eee; } }
+  h1 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,0.25); vertical-align: top; }
+  th { font-weight: 600; opacity: 0.7; }
+  tr.job-row { cursor: pointer; }
+  tr.job-row:hover { background: rgba(128,128,128,0.08); }
+  .status { padding: 0.1rem 0.5rem; border-radius: 0.7rem; font-size: 0.75rem; display: inline-block; }
+  .status.running { background: #2e7d3222; color: #2e7d32; }
+  .status.exited { background: #6c757d22; color: #6c757d; }
+  .status.stopped { background: #c6280022; color: #c62800; }
+  .status.stopping { background: #b8860022; color: #b86000; }
+  .cmd { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.8rem; opacity: 0.85; }
+  button { font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 0.4rem; border: 1px solid rgba(128,128,128,0.4); background: transparent; color: inherit; cursor: pointer; }
+  button:hover { background: rgba(128,128,128,0.15); }
+  pre.log { background: rgba(128,128,128,0.08); padding: 0.75rem; border-radius: 0.4rem; max-height: 320px; overflow: auto; font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; }
+  .empty { opacity: 0.6; font-style: italic; padding: 1rem 0; }
+</style>
+</head>
+<body>
+<h1>jobctl — running &amp; recent jobs</h1>
+<table id="jobs">
+  <thead><tr><th>ID</th><th>Status</th><th>Runtime</th><th>Command</th><th>CWD</th><th></th></tr></thead>
+  <tbody id="jobs-body"></tbody>
+</table>
+<div id="empty" class="empty" style="display:none">No jobs yet.</div>
+
+<script>
+const expanded = new Set();
+
+function fmtDuration(secs) {
+  secs = Math.floor(secs);
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  if (h) return `${h}h${m}m`;
+  if (m) return `${m}m${s}s`;
+  return `${s}s`;
+}
+
+async function fetchJobs() {
+  const res = await fetch('/api/jobs');
+  return res.json();
+}
+
+async function fetchLog(id) {
+  const res = await fetch(`/api/jobs/${id}/log?tail=300`);
+  return res.text();
+}
+
+async function stopJob(id) {
+  await fetch(`/api/jobs/${id}/stop`, { method: 'POST' });
+  render();
+}
+
+function toggle(id) {
+  if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+  render();
+}
+
+async function render() {
+  const jobs = await fetchJobs();
+  const body = document.getElementById('jobs-body');
+  const empty = document.getElementById('empty');
+  body.innerHTML = '';
+  empty.style.display = jobs.length ? 'none' : 'block';
+
+  for (const j of jobs) {
+    const end = j.ended_at || (Date.now() / 1000);
+    const tr = document.createElement('tr');
+    tr.className = 'job-row';
+    tr.onclick = () => toggle(j.id);
+    tr.innerHTML = `
+      <td>${j.id}</td>
+      <td><span class="status ${j.status}">${j.status}</span></td>
+      <td>${fmtDuration(end - j.started_at)}</td>
+      <td class="cmd">${j.cmd.join(' ').slice(0, 100)}</td>
+      <td class="cmd">${j.cwd || ''}</td>
+      <td>${(j.status === 'running' || j.status === 'stopping')
+          ? `<button data-stop="${j.id}">Stop</button>` : ''}</td>
+    `;
+    body.appendChild(tr);
+
+    const stopBtn = tr.querySelector('[data-stop]');
+    if (stopBtn) stopBtn.onclick = (e) => { e.stopPropagation(); stopJob(j.id); };
+
+    if (expanded.has(j.id)) {
+      const logRow = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      const pre = document.createElement('pre');
+      pre.className = 'log';
+      pre.textContent = await fetchLog(j.id);
+      td.appendChild(pre);
+      logRow.appendChild(td);
+      body.appendChild(logRow);
+    }
+  }
+}
+
+render();
+setInterval(render, 2000);
+</script>
+</body>
+</html>

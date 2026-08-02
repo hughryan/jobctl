@@ -1,0 +1,315 @@
+#!/usr/bin/python3
+"""CLI for jobd, the local long-running-job daemon. Works with any shell command.
+
+Usage:
+  jobctl submit [--name NAME] [--cwd DIR] -- <command> [args...]
+  jobctl list
+  jobctl status <id>
+  jobctl logs <id> [--tail N] [--follow]
+  jobctl stop <id>
+  jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]
+  jobctl ui
+
+A leading --host <ssh-alias> runs any of the above on that host over SSH instead of
+locally. The local daemon is never started or contacted in that case:
+  jobctl --host cuda submit --name run-1 -- python train.py
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+STATE_DIR = os.path.expanduser("~/.jobctl")
+DAEMON_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jobd.py")
+DEFAULT_PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
+UI_FORWARD_PORT = 8788
+
+
+def base_url():
+    port_file = os.path.join(STATE_DIR, "daemon.port")
+    port = DEFAULT_PORT
+    if os.path.isfile(port_file):
+        try:
+            port = int(open(port_file).read().strip())
+        except (ValueError, OSError):
+            pass
+    return f"http://127.0.0.1:{port}"
+
+
+def request(method, path, payload=None):
+    url = base_url() + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                  headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        body = resp.read()
+        return json.loads(body) if "json" in ctype else body.decode(errors="replace")
+
+
+def ensure_daemon():
+    try:
+        request("GET", "/api/health")
+        return
+    except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        pass
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log_path = os.path.join(STATE_DIR, "daemon.log")
+    with open(log_path, "ab") as logf:
+        subprocess.Popen(
+            [sys.executable, DAEMON_SRC],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    for _ in range(50):
+        time.sleep(0.1)
+        try:
+            request("GET", "/api/health")
+            return
+        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            continue
+    print("error: jobd daemon did not come up; check ~/.jobctl/daemon.log", file=sys.stderr)
+    sys.exit(1)
+
+
+def fmt_duration(secs):
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m"
+    if m:
+        return f"{m}m{s}s"
+    return f"{s}s"
+
+
+def cmd_submit(args):
+    if "--" not in args:
+        print("error: expected `--` before the command, e.g. jobctl submit --name run-1 -- python train.py", file=sys.stderr)
+        sys.exit(2)
+    sep = args.index("--")
+    opts, command = args[:sep], args[sep + 1:]
+    if not command:
+        print("error: no command given after --", file=sys.stderr)
+        sys.exit(2)
+    name, cwd = "", None
+    i = 0
+    while i < len(opts):
+        if opts[i] == "--name":
+            name = opts[i + 1]
+            i += 2
+        elif opts[i] == "--cwd":
+            cwd = opts[i + 1]
+            i += 2
+        else:
+            print(f"error: unknown option {opts[i]}", file=sys.stderr)
+            sys.exit(2)
+    result = request("POST", "/api/jobs", {"name": name, "cmd": command, "cwd": cwd or os.getcwd()})
+    print(result["id"])
+
+
+def cmd_list(args):
+    jobs = request("GET", "/api/jobs")
+    if not jobs:
+        print("(no jobs)")
+        return
+    print(f"{'ID':<28} {'STATUS':<10} {'RUNTIME':<8} CMD")
+    for j in jobs:
+        end = j["ended_at"] or time.time()
+        runtime = fmt_duration(end - j["started_at"])
+        cmd_str = " ".join(j["cmd"])
+        print(f"{j['id']:<28} {j['status']:<10} {runtime:<8} {cmd_str[:80]}")
+
+
+def cmd_status(args):
+    if not args:
+        print("error: usage: jobctl status <id>", file=sys.stderr)
+        sys.exit(2)
+    meta = request("GET", f"/api/jobs/{args[0]}")
+    print(json.dumps(meta, indent=2))
+
+
+def cmd_logs(args):
+    if not args:
+        print("error: usage: jobctl logs <id> [--tail N] [--follow]", file=sys.stderr)
+        sys.exit(2)
+    job_id = args[0]
+    tail = 200
+    follow = False
+    i = 1
+    while i < len(args):
+        if args[i] == "--tail":
+            tail = int(args[i + 1])
+            i += 2
+        elif args[i] == "--follow":
+            follow = True
+            i += 1
+        else:
+            i += 1
+
+    if not follow:
+        print(request("GET", f"/api/jobs/{job_id}/log?tail={tail}"))
+        return
+
+    seen = 0
+    while True:
+        text = request("GET", f"/api/jobs/{job_id}/log?tail=100000")
+        lines = text.splitlines() if text else []
+        for line in lines[seen:]:
+            print(line)
+        seen = len(lines)
+        meta = request("GET", f"/api/jobs/{job_id}")
+        if meta["status"] not in ("running", "stopping"):
+            break
+        time.sleep(1)
+
+
+def cmd_stop(args):
+    if not args:
+        print("error: usage: jobctl stop <id>", file=sys.stderr)
+        sys.exit(2)
+    meta = request("POST", f"/api/jobs/{args[0]}/stop")
+    print(json.dumps(meta, indent=2))
+
+
+def cmd_wait(args):
+    """Block in this single process until the job reaches a terminal state or the
+    timeout elapses, instead of the caller re-invoking a tool call every poll tick.
+    Default timeout (540s) sits under Bash's default 600s max-timeout ceiling so this
+    always returns cleanly rather than getting hard-killed by the caller's own timeout.
+    """
+    if not args:
+        print("error: usage: jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]", file=sys.stderr)
+        sys.exit(2)
+    job_id = args[0]
+    timeout, poll = 540.0, 2.0
+    i = 1
+    while i < len(args):
+        if args[i] == "--timeout":
+            timeout = float(args[i + 1])
+            i += 2
+        elif args[i] == "--poll":
+            poll = float(args[i + 1])
+            i += 2
+        else:
+            print(f"error: unknown option {args[i]}", file=sys.stderr)
+            sys.exit(2)
+
+    deadline = time.time() + timeout
+    while True:
+        meta = request("GET", f"/api/jobs/{job_id}")
+        if meta["status"] not in ("running", "stopping"):
+            print(json.dumps(meta, indent=2))
+            sys.exit(0)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            meta["timed_out"] = True
+            print(json.dumps(meta, indent=2))
+            sys.exit(1)
+        time.sleep(min(poll, remaining))
+
+
+def cmd_ui(args):
+    print(base_url())
+
+
+def parse_host(argv):
+    """Split a leading `--host <alias>` off argv, returning (alias_or_None, rest).
+
+    An empty alias is rejected rather than ignored: `--host "$SOME_UNSET_VAR"` must not
+    degrade into a local run, which is exactly the silent wrong-machine execution this
+    flag exists to prevent.
+    """
+    if argv[:1] != ["--host"]:
+        return None, argv
+    if len(argv) < 2 or not argv[1]:
+        print("error: --host requires a non-empty ssh alias, e.g. jobctl --host cuda list", file=sys.stderr)
+        sys.exit(2)
+    return argv[1], argv[2:]
+
+
+def ssh_argv(host, args):
+    """Build the `ssh <host> <cmd>` argv that re-runs this invocation remotely.
+
+    Every argument is shell-quoted because the remote command is re-parsed by the
+    remote shell. `~/.local/bin` (where jobctl is symlinked) is prepended explicitly
+    since a non-interactive `ssh host cmd` does not get the login shell's PATH.
+    """
+    remote = " ".join(shlex.quote(a) for a in ["jobctl"] + args)
+    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {remote}']
+
+
+def run_remote(host, args):
+    """Run the invocation on `host` and exit with the remote process's own status.
+
+    stdout/stderr are inherited so output streams live (e.g. `logs --follow`), and the
+    exit code is passed through unchanged so `while ! jobctl wait ...` behaves the same
+    remotely as locally. Args are forwarded verbatim - notably, submit's `--cwd` default
+    is left to the remote jobctl, since this machine's cwd does not exist over there.
+    """
+    try:
+        proc = subprocess.run(ssh_argv(host, args))
+    except OSError as exc:
+        print(f"error: could not run ssh for host '{host}': {exc}", file=sys.stderr)
+        sys.exit(1)
+    if proc.returncode == 255:
+        print(f"error: ssh could not reach host '{host}' (unreachable, or auth failed)", file=sys.stderr)
+    sys.exit(proc.returncode)
+
+
+def remote_ui(host):
+    """Print the remote dashboard URL plus the local forward the human runs to reach it.
+
+    The local port differs from the remote one so the tunnel can coexist with this
+    machine's own jobd.
+    """
+    proc = subprocess.run(ssh_argv(host, ["ui"]), capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        print(f"error: could not get the dashboard URL from host '{host}'", file=sys.stderr)
+        sys.exit(proc.returncode)
+    url = proc.stdout.strip().splitlines()[-1]  # last line, in case ssh prepends a banner
+    remote_port = url.rsplit(":", 1)[-1]
+    print(url)
+    print(f"ssh -N -L {UI_FORWARD_PORT}:127.0.0.1:{remote_port} {host}   "
+          f"# then open http://127.0.0.1:{UI_FORWARD_PORT}")
+
+
+COMMANDS = {
+    "submit": cmd_submit,
+    "list": cmd_list,
+    "status": cmd_status,
+    "logs": cmd_logs,
+    "stop": cmd_stop,
+    "wait": cmd_wait,
+    "ui": cmd_ui,
+}
+
+
+def main():
+    host, argv = parse_host(sys.argv[1:])
+    if not argv or argv[0] not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    if host is not None:
+        # Deliberately ahead of ensure_daemon(): a --host invocation must never start or
+        # talk to the local daemon, or a job meant for the remote box would silently run
+        # here instead. The remote jobctl manages its own daemon. Both branches return,
+        # so local execution is unreachable once a host is given.
+        if argv[0] == "ui":
+            remote_ui(host)
+        else:
+            run_remote(host, argv)
+        return
+    ensure_daemon()
+    COMMANDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main()
