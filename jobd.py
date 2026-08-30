@@ -9,7 +9,9 @@ daemon itself gets restarted while jobs are running.
 Each job runs under a supervisor — this same file re-invoked as `jobd.py --supervise <id>` —
 that spawns the command, waits on it, and records the exit code to supervisor.json. The
 supervisor lives exactly as long as the job, so exit codes survive daemon restarts and
-crashes instead of depending on the daemon holding a Popen handle.
+crashes instead of depending on the daemon holding a Popen handle. Submit still confirms the
+command actually started before returning an id: daemon and supervisor share a pipe whose
+closure means "exec succeeded" and whose contents are the exec error.
 
 One writer per file: the daemon is the only writer of meta.json, and the supervisor is the
 only writer of supervisor.json; the daemon composes the supervisor's record into meta.json
@@ -17,6 +19,7 @@ during reconciliation. Two writers of one file would lose updates to read-modify
 """
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -36,6 +39,9 @@ JOBS_DIR = os.path.join(STATE_DIR, "jobs")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 STOP_GRACE_SECS = 10
+# How long submit_job waits for the supervisor to confirm the command started. Generous: it
+# only has to cover interpreter startup on a loaded machine, and is never reached in practice.
+SUBMIT_CONFIRM_SECS = 10
 
 os.makedirs(JOBS_DIR, exist_ok=True)  # creates STATE_DIR too, wherever it points
 
@@ -99,13 +105,36 @@ def pid_alive(pid):
         return False
 
 
-def supervise(job_id):
+def report_status(status_fd, message):
+    """Report the outcome of the exec to submit_job, then close its end of the pipe.
+
+    An empty message means success: the daemon's read sees EOF and nothing else. A failing
+    write is not worth reacting to — the daemon has stopped listening (its confirmation
+    timed out), and the job's fate is recorded on disk either way.
+    """
+    if status_fd is None:
+        return
+    try:
+        if message:
+            os.write(status_fd, message.encode())
+    except OSError:
+        pass
+    finally:
+        os.close(status_fd)
+
+
+def supervise(job_id, status_fd=None):
     """Run as a job's supervisor: spawn the command, wait for it, record its exit code.
 
     The daemon spawns this (`jobd.py --supervise <id>`) instead of the command itself, so
     the exit code is recorded by a process that lives exactly as long as the job — a daemon
     restart or crash between submit and exit no longer loses it. This function writes
     supervisor.json and only supervisor.json; meta.json belongs to the daemon.
+
+    status_fd, when given, is the write end of the pipe submit_job blocks on to learn
+    whether the command really started: closing it unwritten is the success signal, and any
+    bytes written to it are the exec error. It is optional so `--supervise` stays runnable
+    by hand.
     """
     # Ignore SIGTERM before spawning anything: stop_job SIGTERMs the whole group, and the
     # supervisor must outlive the child by a moment to record how it died.
@@ -129,13 +158,20 @@ def supervise(job_id):
             # escalate to SIGKILL. preexec_fn runs post-fork in the child; it is unsafe
             # only in threaded processes, and the supervisor is single-threaded.
             preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL),
+            # Popen closes inherited fds in the child by default and nothing here passes
+            # status_fd along, so the command does not inherit it — required, not incidental:
+            # a copy held by a long-running job would keep the pipe from ever reaching EOF and
+            # every submit would block for SUBMIT_CONFIRM_SECS. Never add pass_fds here.
         )
     except Exception as exc:
-        # Exec failure is asynchronous now — submit already returned an id. Fail as a job:
-        # explain in the log, record 127 (the shell's "command not found" convention).
+        # Record the terminal result *before* reporting the failure, so the job is already
+        # terminal on disk by the time submit turns this into a 400 — a job that never ran
+        # must never be left sitting at "running". 127 is the shell's "command not found".
         logf.write(f"jobctl: could not execute {meta['cmd'][0]!r}: {exc}\n".encode())
         write_json_atomic(supervisor_path(job_id), {"exit_code": 127, "ended_at": time.time()})
+        report_status(status_fd, str(exc) or exc.__class__.__name__)
         return 0
+    report_status(status_fd, "")  # exec succeeded: EOF alone says so, so write nothing
     write_json_atomic(supervisor_path(job_id), {"job_pid": proc.pid})
     rc = proc.wait()
     write_json_atomic(supervisor_path(job_id),
@@ -166,21 +202,62 @@ def submit_job(name, cmd, cwd, env_overrides):
     # supervisor writes it; the daemon keeps no handle on it.
     open(os.path.join(d, "log"), "ab").close()
 
-    proc = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--supervise", job_id],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,  # group leader: pgid == pid, and signals aimed at the daemon don't reach it
-    )
-    # "pid" is the *supervisor's* pid, deliberately: stop_job needs the process-group leader
-    # for killpg, and liveness checks need a process that lives exactly as long as the job.
-    # The command's own pid surfaces as "job_pid", folded in from supervisor.json.
-    meta["pid"] = proc.pid
-    write_meta(job_id, meta)
-    with lock:
-        popens[job_id] = proc
-    return job_id
+    # The exec now happens in the supervisor, one process further away, so the daemon's own
+    # Popen succeeding no longer proves the command ran. This pipe carries that news back:
+    # the supervisor closes it on success and writes the error to it on failure, so submit
+    # stays synchronous — a returned id means the command started, and a bad executable or
+    # cwd fails the submit call itself, exactly as it did before there was a supervisor.
+    r, w = os.pipe()
+    try:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--supervise", job_id,
+                 "--status-fd", str(w)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # group leader: pgid == pid, and signals aimed at the daemon don't reach it
+                pass_fds=(w,),  # os.pipe() fds are non-inheritable (PEP 446); this is what hands w over
+            )
+        except Exception as exc:
+            # The daemon failed to create a supervisor at all, so no supervisor exists to own
+            # supervisor.json for this job. The daemon therefore records the terminal state in
+            # meta.json, the file it does own. Without this the job would keep "running" and a
+            # null pid forever: reconcile_job reads a null pid as "proves nothing".
+            with open(os.path.join(d, "log"), "ab", buffering=0) as logf:
+                logf.write(f"jobctl: could not start a supervisor: {exc}\n".encode())
+            meta["status"] = "exited"
+            meta["exit_code"] = 127
+            meta["ended_at"] = time.time()
+            write_meta(job_id, meta)
+            raise
+        finally:
+            # Close the parent's write end the moment the child has its copy. EOF arrives only
+            # once every copy is closed, so holding this one would make the read below block
+            # for the full SUBMIT_CONFIRM_SECS on every single submit.
+            os.close(w)
+
+        # "pid" is the *supervisor's* pid, deliberately: stop_job needs the process-group leader
+        # for killpg, and liveness checks need a process that lives exactly as long as the job.
+        # The command's own pid surfaces as "job_pid", folded in from supervisor.json.
+        meta["pid"] = proc.pid
+        write_meta(job_id, meta)
+        with lock:
+            popens[job_id] = proc
+
+        ready, _, _ = select.select([r], [], [], SUBMIT_CONFIRM_SECS)
+        if ready:
+            err = os.read(r, 4096)
+            if err:
+                # Bytes mean exec failed, and the supervisor recorded the job terminal before
+                # writing them. Raising here becomes do_POST's 400 with the OS error in it.
+                raise RuntimeError(err.decode(errors="replace"))
+        # EOF (or, in the pathological case, a timed-out wait) — the job is under way. A slow
+        # confirmation is never a reason to discard a job that may well be running: fall back
+        # to the asynchronous behavior and return the id.
+        return job_id
+    finally:
+        os.close(r)
 
 
 def reconcile_job(job_id):
@@ -449,6 +526,9 @@ def main():
 if __name__ == "__main__":
     # Supervisor mode: one process per job, spawned by submit_job. Dispatched ahead of the
     # daemon path so a supervisor never tries to bind the port or take over the state dir.
-    if len(sys.argv) == 3 and sys.argv[1] == "--supervise":
-        sys.exit(supervise(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--supervise":
+        # `--status-fd N` is optional so `--supervise <id>` stays runnable on its own.
+        status_fd = (int(sys.argv[4]) if len(sys.argv) == 5 and sys.argv[3] == "--status-fd"
+                     else None)
+        sys.exit(supervise(sys.argv[2], status_fd))
     sys.exit(main())

@@ -127,12 +127,21 @@ group: `SIGTERM` first (which the supervisor ignores and the job does not, so th
 typically `-15` — still gets recorded), escalating to `SIGKILL` after a 10 second grace period, so
 a job that spawns children does not leave orphans behind.
 
-**A command that cannot start fails as a job, not as a submit error.** Because the supervisor — not
-the daemon — executes the command, a bad executable or a missing `--cwd` directory no longer fails
-the submit call. `jobctl submit -- definitely-not-a-command` still prints a job id; the job then
-immediately reaches `exited` with `exit_code` 127 (the shell's "command not found" convention) and
-the reason on the first line of its log. A job that finishes suspiciously fast deserves a
-`jobctl status` and `jobctl logs` look.
+**A returned job id proves the command started.** The supervisor stands between the daemon and your
+command, so the daemon's own spawn succeeding no longer proves anything — it only proves that Python
+started. Letting `submit` return on that would mean `jobctl submit -- definitely-not-a-command`
+printing a job id for a job that was already dead, the kind of failure you discover an hour later.
+So the daemon and the supervisor share a pipe: the daemon keeps the read end, the supervisor gets
+the write end, and the supervisor either closes it (the command is running) or writes the exec error
+to it (the command never started). Closure means started, contents are the error — which is why it
+is a pipe and not a poll: there is no interval to guess at, nothing to retry, and the answer arrives
+the instant it exists rather than one sleep later. A bad executable or a missing `--cwd` directory
+therefore fails the `submit` call itself — non-zero exit, no job id, the OS error in the daemon's
+reply — exactly as it did before there was a supervisor. The job is recorded terminal (`exit_code`
+127, the shell's "command not found" convention, with the reason on the first line of its log)
+*before* the error travels back, so a command that never ran can never sit in the list as `running`.
+The one loose end is a confirmation that takes more than ten seconds: `submit` then returns the id
+unconfirmed rather than throwing away a job that is very probably running.
 
 **State lives on disk.** Each job gets a directory under `~/.jobctl/jobs/<id>/` containing
 `meta.json` (id, name, command, cwd, pid, status, timestamps, exit code), `supervisor.json` (the
