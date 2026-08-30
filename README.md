@@ -136,8 +136,8 @@ the write end, and the supervisor either closes it (the command is running) or w
 to it (the command never started). Closure means started, contents are the error — which is why it
 is a pipe and not a poll: there is no interval to guess at, nothing to retry, and the answer arrives
 the instant it exists rather than one sleep later. A bad executable or a missing `--cwd` directory
-therefore fails the `submit` call itself — non-zero exit, no job id, the OS error in the daemon's
-reply — exactly as it did before there was a supervisor. The job is recorded terminal (`exit_code`
+therefore fails the `submit` call itself — non-zero exit, no job id, and the OS error printed as a
+plain `error:` line — exactly as it did before there was a supervisor. The job is recorded terminal (`exit_code`
 127, the shell's "command not found" convention, with the reason on the first line of its log)
 *before* the error travels back, so a command that never ran can never sit in the list as `running`.
 The one loose end is a confirmation that takes more than ten seconds: `submit` then returns the id

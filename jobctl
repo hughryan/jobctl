@@ -54,14 +54,31 @@ def base_url():
 
 
 def request(method, path, payload=None):
+    """Call the daemon, surfacing its errors as messages rather than tracebacks.
+
+    The daemon reports failures as a JSON {"error": ...} body with a 4xx/5xx status, which
+    urlopen raises as HTTPError. Letting that escape would print a Python traceback ending in
+    a bare "HTTP Error 400: Bad Request" and strand the actual reason - an unrunnable command,
+    a missing cwd - in a body nobody sees. This is the normal way a bad `submit` reports
+    itself, so it has to read as a plain error.
+    """
     url = base_url() + path
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                   headers={"Content-Type": "application/json"} if data else {})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        ctype = resp.headers.get("Content-Type", "")
-        body = resp.read()
-        return json.loads(body) if "json" in ctype else body.decode(errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            body = resp.read()
+            return json.loads(body) if "json" in ctype else body.decode(errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read()).get("error", "")
+        except (ValueError, OSError):
+            pass
+        print(f"error: {detail or exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def ensure_daemon():
