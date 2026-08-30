@@ -136,7 +136,7 @@ def cmd_submit(args):
     if not command:
         print("error: no command given after --", file=sys.stderr)
         sys.exit(2)
-    name, cwd = "", None
+    name, cwd, env = "", None, {}
     i = 0
     while i < len(opts):
         if opts[i] == "--name":
@@ -145,10 +145,22 @@ def cmd_submit(args):
         elif opts[i] == "--cwd":
             cwd = opts[i + 1]
             i += 2
+        elif opts[i] == "--env":
+            # Split on the first `=` only, so a value may itself contain `=`. An empty value
+            # is legal and meaningful: `--env PYTHONUNBUFFERED=` opts out of that default,
+            # because the supervisor applies these last and Python honours only a non-empty
+            # value. Repeatable; the last assignment to a key wins, as with `--since`.
+            key, sep_eq, value = (opts[i + 1] if i + 1 < len(opts) else "").partition("=")
+            if not sep_eq or not key:
+                print("error: --env expects KEY=VALUE with a non-empty KEY", file=sys.stderr)
+                sys.exit(2)
+            env[key] = value
+            i += 2
         else:
             print(f"error: unknown option {opts[i]}", file=sys.stderr)
             sys.exit(2)
-    result = request("POST", "/api/jobs", {"name": name, "cmd": command, "cwd": cwd or os.getcwd()})
+    result = request("POST", "/api/jobs",
+                     {"name": name, "cmd": command, "cwd": cwd or os.getcwd(), "env": env})
     print(result["id"])
 
 

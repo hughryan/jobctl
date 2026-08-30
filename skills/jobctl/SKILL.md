@@ -15,7 +15,7 @@ Use it whenever a task:
 ## Commands
 
 ```bash
-jobctl submit [--name NAME] [--cwd DIR] -- <any command and args>   # returns a job id immediately
+jobctl submit [--name NAME] [--cwd DIR] [--env K=V]... -- <any command and args>   # returns a job id immediately
 jobctl list [--all] [--since DURATION]                               # table of jobs + status: last 24h plus every active job
 jobctl status <id>                                                   # full JSON: status, pid, exit_code, timestamps
 jobctl logs <id> [--tail N] [--follow]                               # read, or tail, combined stdout+stderr; --follow is bounded (see below)
@@ -43,6 +43,10 @@ The daemon auto-starts on first use of any `jobctl` command - no setup required.
 `submit` confirms the command actually started before it returns, so a bad executable or `--cwd` fails the `submit` call itself - non-zero exit, no job id, and the OS error on stderr (only if that confirmation takes over 10 seconds is an id returned unconfirmed). Each job runs under a per-job supervisor that records the exit code from outside the daemon's lifetime, so exit codes survive daemon restarts - a `null` exit_code no longer means "the daemon restarted", only that the supervisor itself was killed without recording.
 
 `jobctl daemon status` reports on the daemon itself and never starts one, so it is safe to run just to look. Its point is the `source:` line: a daemon whose `jobd.py` has been moved or deleted keeps serving the API from code in memory while the dashboard silently 404s, and that is otherwise invisible. `jobctl daemon restart` fixes it. Restarting does **not** stop running jobs - they run in their own sessions under their own supervisors, which record exit codes regardless of the daemon - so it is not something to avoid while work is in flight.
+
+`--env KEY=VALUE` sets one variable in the job's environment, on top of the daemon's own. Repeat it per variable (`--env CUDA_VISIBLE_DEVICES=1 --env WANDB_MODE=offline`); the value is split on the first `=` only, so a value may contain `=`, and a repeated key takes its last value. Use it for anything the job reads from the environment - device selection, API keys already in your shell, offline/debug switches - rather than wrapping the command in a shell.
+
+Job logs stream live: `jobctl` sets `PYTHONUNBUFFERED=1` for every job, so a Python job's output reaches the log as it is written and `jobctl logs <id> --tail 20` is a real progress check on a *running* job, not just a post-mortem. Without it a job's file-backed stdout is block-buffered and the log stays empty for hours on a perfectly healthy run - which is exactly the signal the stall check below relies on. This covers Python only; a non-Python program that block-buffers needs its own unbuffered flag or `stdbuf -oL`. Override the default with `--env PYTHONUNBUFFERED=` (empty value) if a job is genuinely slowed by unbuffered writes.
 
 Log output already normalizes bare `\r` to line breaks (Python's line-splitting treats `\r` as a boundary), so `tqdm`-style progress bars show as clean successive lines in `jobctl logs` and the dashboard - no manual `tr '\r' '\n'` needed.
 

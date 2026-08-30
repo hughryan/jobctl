@@ -164,6 +164,14 @@ def supervise(job_id, status_fd=None):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     meta = read_meta(job_id)
     env = dict(os.environ)
+    # A job's stdout is a file, not a tty, so Python block-buffers it and prints nothing
+    # readable until 4KB has accumulated or the process exits — `jobctl logs` on a healthy
+    # 12-hour run would sit empty for hours. Default it on here, in the one place a job's
+    # environment is composed, so an HTTP submit that bypasses the CLI gets it too. It goes
+    # *before* the update so meta["env"] wins: `--env PYTHONUNBUFFERED=` sets it empty, and
+    # Python honours only a non-empty value, which makes that a genuine opt-out with no
+    # special-casing. Never reorder these two lines.
+    env["PYTHONUNBUFFERED"] = "1"
     env.update(meta.get("env") or {})
     logf = open(os.path.join(job_dir(job_id), "log"), "ab", buffering=0)
     try:
