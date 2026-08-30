@@ -3,12 +3,13 @@
 
 Usage:
   jobctl submit [--name NAME] [--cwd DIR] -- <command> [args...]
-  jobctl list
+  jobctl list [--all | --since DURATION]
   jobctl status <id>
   jobctl logs <id> [--tail N] [--follow]
   jobctl stop <id>
   jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]
   jobctl ui
+  jobctl daemon <status|restart|stop>
 
 A leading --host <ssh-alias> runs any of the above on that host over SSH instead of
 locally. The local daemon is never started or contacted in that case:
@@ -17,16 +18,34 @@ locally. The local daemon is never started or contacted in that case:
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-STATE_DIR = os.path.expanduser("~/.jobctl")
+# $JOBCTL_STATE_DIR selects which daemon this CLI talks to, by selecting which daemon.port
+# it reads. It is inherited by the daemon ensure_daemon() spawns, so pointing it at a scratch
+# directory gives a fully independent instance — its own port, pid, log and jobs.
+STATE_DIR = os.path.expanduser(os.environ.get("JOBCTL_STATE_DIR") or "~/.jobctl")
 DAEMON_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jobd.py")
 DEFAULT_PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 UI_FORWARD_PORT = 8788
+LIST_DEFAULT_WINDOW_SECS = 86400
+# Ceiling on how long any single jobctl invocation blocks, overridable with $JOBCTL_MAX_WAIT.
+# It is sized against the *caller's* prompt-cache TTL, not anything internal to jobctl: an AI
+# agent's cache entry lives 60 minutes and is refreshed on each request it makes, and it makes
+# none while blocked inside one tool call. Blocking past that window throws away a whole
+# session's cached context. 45 minutes leaves margin for the tool return and the model turn
+# that follow the block.
+DEFAULT_MAX_WAIT_SECS = 2700.0
+ACTIVE_STATUSES = ("running", "stopping")
+# How long `daemon stop`/`daemon restart` waits for a SIGTERMed daemon to exit before
+# escalating to SIGKILL. The daemon has nothing to flush on the way out - jobs and their
+# logs belong to the supervisors - so a few seconds is generous.
+DAEMON_STOP_GRACE_SECS = 5.0
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def base_url():
@@ -41,14 +60,31 @@ def base_url():
 
 
 def request(method, path, payload=None):
+    """Call the daemon, surfacing its errors as messages rather than tracebacks.
+
+    The daemon reports failures as a JSON {"error": ...} body with a 4xx/5xx status, which
+    urlopen raises as HTTPError. Letting that escape would print a Python traceback ending in
+    a bare "HTTP Error 400: Bad Request" and strand the actual reason - an unrunnable command,
+    a missing cwd - in a body nobody sees. This is the normal way a bad `submit` reports
+    itself, so it has to read as a plain error.
+    """
     url = base_url() + path
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                   headers={"Content-Type": "application/json"} if data else {})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        ctype = resp.headers.get("Content-Type", "")
-        body = resp.read()
-        return json.loads(body) if "json" in ctype else body.decode(errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            body = resp.read()
+            return json.loads(body) if "json" in ctype else body.decode(errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read()).get("error", "")
+        except (ValueError, OSError):
+            pass
+        print(f"error: {detail or exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def ensure_daemon():
@@ -60,6 +96,8 @@ def ensure_daemon():
     os.makedirs(STATE_DIR, exist_ok=True)
     log_path = os.path.join(STATE_DIR, "daemon.log")
     with open(log_path, "ab") as logf:
+        # No env= : the daemon inherits os.environ, so JOBCTL_STATE_DIR and JOBCTL_PORT
+        # reach it without being plumbed through explicitly.
         subprocess.Popen(
             [sys.executable, DAEMON_SRC],
             stdin=subprocess.DEVNULL,
@@ -74,7 +112,7 @@ def ensure_daemon():
             return
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
             continue
-    print("error: jobd daemon did not come up; check ~/.jobctl/daemon.log", file=sys.stderr)
+    print(f"error: jobd daemon did not come up; check {log_path}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -114,17 +152,93 @@ def cmd_submit(args):
     print(result["id"])
 
 
+def parse_duration(text):
+    """Parse `<number><unit>` (unit s/m/h/d, a bare number meaning seconds) into seconds.
+
+    Returns None for anything unparseable, so the caller reports its own error message.
+    """
+    unit = DURATION_UNITS.get(text[-1:])
+    try:
+        value = float(text[:-1] if unit else text)
+    except ValueError:
+        return None
+    return value * (unit or 1)
+
+
+def max_wait_secs():
+    """Resolve the blocking ceiling from $JOBCTL_MAX_WAIT, in the same syntax as `--since`.
+
+    Resolved per call rather than at import so a malformed value is reported only by the
+    commands that actually block, instead of by every unrelated `jobctl list`. A bad value
+    warns and falls back to the default rather than exiting: a typo in an environment
+    variable must not take job control away from the caller.
+    """
+    raw = os.environ.get("JOBCTL_MAX_WAIT", "")
+    if not raw:
+        return DEFAULT_MAX_WAIT_SECS
+    secs = parse_duration(raw)
+    if secs is None or secs <= 0:
+        print(f"warning: ignoring JOBCTL_MAX_WAIT={raw!r} — expected a positive duration like "
+              f"45m, 2700; using {DEFAULT_MAX_WAIT_SECS:g}s", file=sys.stderr)
+        return DEFAULT_MAX_WAIT_SECS
+    return secs
+
+
 def cmd_list(args):
+    """List jobs from the last 24h by default, plus every active job whatever its age.
+
+    A long-lived daemon accumulates hundreds of finished jobs, and printing all of them
+    buries the few that matter. Active jobs are exempt from the window because a job that
+    is still running must never be absent from this table merely because it started days
+    ago. `--all` and `--since` both set the same window, so the last one given wins.
+    """
+    window = LIST_DEFAULT_WINDOW_SECS
+    i = 0
+    while i < len(args):
+        if args[i] == "--all":
+            window = None
+            i += 1
+        elif args[i] == "--since":
+            window = parse_duration(args[i + 1] if i + 1 < len(args) else "")
+            if window is None:
+                print("error: --since expects a duration like 30m, 2h, 7d", file=sys.stderr)
+                sys.exit(2)
+            i += 2
+        else:
+            print(f"error: unknown option {args[i]}", file=sys.stderr)
+            sys.exit(2)
+
     jobs = request("GET", "/api/jobs")
     if not jobs:
         print("(no jobs)")
         return
-    print(f"{'ID':<28} {'STATUS':<10} {'RUNTIME':<8} CMD")
-    for j in jobs:
-        end = j["ended_at"] or time.time()
-        runtime = fmt_duration(end - j["started_at"])
-        cmd_str = " ".join(j["cmd"])
-        print(f"{j['id']:<28} {j['status']:<10} {runtime:<8} {cmd_str[:80]}")
+    cutoff = None if window is None else time.time() - window
+    shown = [j for j in jobs
+             if j["status"] in ACTIVE_STATUSES or cutoff is None or j["started_at"] >= cutoff]
+    hidden = len(jobs) - len(shown)
+
+    if not shown:
+        print("(no recent jobs)")
+    else:
+        # The id is a handle the caller copy-pastes, so its column grows to fit instead of
+        # truncating. The command cell collapses whitespace so a multi-line command (a
+        # heredoc, say) stays one row rather than spilling its body into the table.
+        id_w = max(12, max(len(j["id"]) for j in shown))
+        print(f"{'ID':<{id_w}} {'STATUS':<8} {'RUNTIME':<8} CMD")
+        for j in shown:
+            end = j["ended_at"] or time.time()
+            runtime = fmt_duration(end - j["started_at"])
+            cmd_str = " ".join(" ".join(j["cmd"]).split())
+            if len(cmd_str) > 80:
+                cmd_str = cmd_str[:80] + "…"
+            print(f"{j['id']:<{id_w}} {j['status']:<8} {runtime:<8} {cmd_str}")
+
+    if hidden:
+        # The hint names bare flags rather than a full `jobctl list ...` command: this code
+        # also runs on the far side of an SSH hop for `jobctl --host <alias> list`, where a
+        # copy-pasteable command line would wrongly target the local daemon.
+        print()
+        print(f"{hidden} older job{'' if hidden == 1 else 's'} hidden — use --all or --since 7d")
 
 
 def cmd_status(args):
@@ -157,16 +271,32 @@ def cmd_logs(args):
         print(request("GET", f"/api/jobs/{job_id}/log?tail={tail}"))
         return
 
-    seen = 0
+    # Following starts from the last `tail` lines, like `tail -f`, rather than replaying the
+    # whole log: on a long-running job that first dump is enormous, and it would be repeated
+    # every time a caller resumes. `--tail 0` is therefore the resume mode - new output only.
+    # Following is also bounded by the same ceiling as `wait`, and reports a timeout the same
+    # way (exit 1), so `while ! jobctl logs <id> --follow --tail 0; do :; done` resumes cleanly
+    # and an elapsed window is never mistaken for the job having finished.
+    max_wait = max_wait_secs()
+    deadline = time.time() + max_wait
+    seen = None
     while True:
         text = request("GET", f"/api/jobs/{job_id}/log?tail=100000")
         lines = text.splitlines() if text else []
-        for line in lines[seen:]:
+        start = len(lines) - max(tail, 0) if seen is None else seen
+        for line in lines[max(start, 0):]:
             print(line)
         seen = len(lines)
         meta = request("GET", f"/api/jobs/{job_id}")
-        if meta["status"] not in ("running", "stopping"):
+        if meta["status"] not in ACTIVE_STATUSES:
             break
+        if time.time() >= deadline:
+            # Bare flags rather than a copy-pasteable command line: this code also runs on the
+            # far side of an SSH hop, where the id means nothing to the local daemon.
+            print(f"note: stopped following after {max_wait:g}s (JOBCTL_MAX_WAIT); the job is "
+                  "still running — resume with --follow --tail 0 for new output only",
+                  file=sys.stderr)
+            sys.exit(1)
         time.sleep(1)
 
 
@@ -183,6 +313,10 @@ def cmd_wait(args):
     timeout elapses, instead of the caller re-invoking a tool call every poll tick.
     Default timeout (540s) sits under Bash's default 600s max-timeout ceiling so this
     always returns cleanly rather than getting hard-killed by the caller's own timeout.
+
+    A larger `--timeout` is clamped to max_wait_secs(); the exit-code contract is unchanged,
+    so a clamped wait that expires is an ordinary timeout and the documented
+    `while ! jobctl wait ...; do :; done` loop simply wakes up and re-blocks more often.
     """
     if not args:
         print("error: usage: jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]", file=sys.stderr)
@@ -201,6 +335,13 @@ def cmd_wait(args):
             print(f"error: unknown option {args[i]}", file=sys.stderr)
             sys.exit(2)
 
+    max_wait = max_wait_secs()
+    if timeout > max_wait:
+        # stderr, so the JSON on stdout stays parseable by the caller.
+        print(f"note: --timeout {timeout:g} clamped to {max_wait:g}s (JOBCTL_MAX_WAIT); "
+              "the wait loop will resume", file=sys.stderr)
+        timeout = max_wait
+
     deadline = time.time() + timeout
     while True:
         meta = request("GET", f"/api/jobs/{job_id}")
@@ -217,6 +358,296 @@ def cmd_wait(args):
 
 def cmd_ui(args):
     print(base_url())
+
+
+def read_daemon_files():
+    """Return the (pid, port) recorded in STATE_DIR, either as None if unreadable."""
+    values = []
+    for name in ("daemon.pid", "daemon.port"):
+        try:
+            with open(os.path.join(STATE_DIR, name)) as f:
+                values.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            values.append(None)
+    return values[0], values[1]
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def port_healthy(port):
+    if not port:
+        return False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as resp:
+            return resp.status == 200 and json.loads(resp.read()).get("ok") is True
+    except Exception:
+        return False
+
+
+def live_daemon():
+    """Return (pid, port) of a daemon actually serving STATE_DIR, or None.
+
+    Deliberately the same two-signal test jobd.py's own live_daemon() uses, and for the same
+    reason: pid numbers get recycled, so a live pid alone would report an unrelated process as
+    the daemon, and a port that answers alone could be anything else bound to it. Both must
+    agree. Keeping the test identical also means this command's verdict matches the one the
+    daemon's start-up guard will reach.
+    """
+    pid, port = read_daemon_files()
+    if pid_alive(pid) and port_healthy(port):
+        return pid, port
+    return None
+
+
+def ps_field(pid, keyword):
+    """One `ps -o <keyword>=` field for a pid, or None if ps cannot answer.
+
+    `command` and `etime` are the only keywords used, and both behave identically on macOS and
+    Linux, which are the two platforms this tool runs on. Every failure - no ps, an unexpected
+    exit, empty output - becomes None so the caller can report "unknown": `daemon status` is a
+    diagnostic and must not be the thing that crashes.
+    """
+    try:
+        proc = subprocess.run(["ps", "-o", f"{keyword}=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def daemon_source(pid):
+    """The jobd.py path a running daemon was started from, read out of its argv via ps.
+
+    Read from the process table rather than asked over the API on purpose: this has to work
+    against a daemon of any vintage, including one started long before this command existed -
+    which is exactly the daemon whose source path you need to see.
+    """
+    line = ps_field(pid, "command")
+    if not line:
+        return None
+    for arg in line.split():
+        if arg.endswith("jobd.py"):
+            return arg
+    return None
+
+
+def daemon_uptime_secs(pid):
+    """Seconds since a daemon started, from `ps -o etime=`.
+
+    etime prints `[[DD-]HH:]MM:SS` on macOS and Linux alike. Anything that does not parse
+    returns None so the caller omits the line rather than printing a guessed uptime.
+    """
+    text = ps_field(pid, "etime")
+    if not text:
+        return None
+    days, _, clock = text.rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3:
+        return None
+    try:
+        secs = 0
+        for part in parts:
+            secs = secs * 60 + int(part)
+        return secs + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def active_jobs():
+    """Jobs the daemon currently considers running or stopping; [] if it cannot be asked."""
+    try:
+        jobs = request("GET", "/api/jobs")
+    except (urllib.error.URLError, OSError):
+        return []
+    return [j for j in jobs if j["status"] in ACTIVE_STATUSES]
+
+
+def print_job_lines(jobs):
+    id_w = max(12, max(len(j["id"]) for j in jobs))
+    for j in jobs:
+        job_pid = j["job_pid"] if j["job_pid"] is not None else "(none recorded)"
+        print(f"  {j['id']:<{id_w}} {j['status']:<8} job pid {job_pid}")
+
+
+def daemon_status():
+    """Report on the daemon serving STATE_DIR, whether or not one is running.
+
+    Exits 0 either way: like `git status`, the command succeeded when it told you the state.
+    """
+    live = live_daemon()
+    recorded_pid, recorded_port = read_daemon_files()
+
+    def field(label, value):
+        print(f"{label + ':':<9}{value}")
+
+    if live is None:
+        field("daemon", "(not running)")
+        field("state", STATE_DIR)
+        if recorded_pid or recorded_port:
+            field("stale", f"daemon.pid {recorded_pid}, daemon.port {recorded_port} - "
+                           "no daemon is answering; the next jobctl command will start one")
+        return
+
+    pid, port = live
+    field("daemon", f"running (pid {pid})")
+    field("port", port)
+    field("state", STATE_DIR)
+    uptime = daemon_uptime_secs(pid)
+    if uptime is not None:
+        field("uptime", fmt_duration(uptime))
+    source = daemon_source(pid)
+    if source is None:
+        field("source", "unknown (could not read the daemon's command line from ps)")
+    elif os.path.exists(source):
+        field("source", source)
+    else:
+        # The headline diagnostic. A daemon keeps serving from code resident in memory long
+        # after that code is moved or deleted, and the only visible symptom is a dashboard
+        # that 404s - because jobd.py resolves STATIC_DIR against __file__ at import time.
+        field("source", f"{source}  ** MISSING **")
+        print("         this file no longer exists. The daemon is still serving its API from")
+        print("         code held in memory, but its STATIC_DIR was resolved against that path")
+        print("         at import, so the dashboard will 404 until you run `jobctl daemon restart`.")
+    jobs = active_jobs()
+    running = sum(1 for j in jobs if j["status"] == "running")
+    stopping = len(jobs) - running
+    field("jobs", f"{running} running" + (f", {stopping} stopping" if stopping else ""))
+
+
+def daemon_gone(pid, port, timeout):
+    """Wait until the pid has exited *and* the port has stopped answering.
+
+    Both conditions, because a new daemon's own start-up guard tests both: starting while
+    either still holds would make it refuse to run, and the restart would fail confusingly
+    instead of racing quietly.
+    """
+    deadline = time.time() + timeout
+    while True:
+        if not pid_alive(pid) and not port_healthy(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def stop_daemon(live):
+    """SIGTERM the daemon at `live`, escalate to SIGKILL, and wait for it to be fully gone.
+
+    The signal goes to the daemon's own pid - never os.killpg. This command stops the daemon;
+    it does not stop jobs. Each job's supervisor is started in its own session, so a
+    process-group signal would not reach one anyway, but the distinction is the whole point of
+    the command: jobs are meant to outlive the daemon, and restarting must never become an
+    accidental way to kill a training run.
+    """
+    pid, port = live
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"error: could not signal daemon pid {pid}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if daemon_gone(pid, port, DAEMON_STOP_GRACE_SECS):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return daemon_gone(pid, port, DAEMON_STOP_GRACE_SECS)
+
+
+def daemon_stop():
+    """Stop the daemon and nothing else. Stopping an already-stopped daemon is a success."""
+    live = live_daemon()
+    if live is None:
+        print(f"no daemon is running for {STATE_DIR}")
+        return
+    jobs = active_jobs()  # asked while the daemon can still answer
+    print(f"stopping daemon pid {live[0]} (port {live[1]})")
+    if not stop_daemon(live):
+        print(f"error: daemon pid {live[0]} did not exit, even after SIGKILL", file=sys.stderr)
+        sys.exit(1)
+    print("stopped")
+    if jobs:
+        print()
+        print(f"{len(jobs)} job{'' if len(jobs) == 1 else 's'} still running - the daemon "
+              "does not own running jobs, and no signal from this command reached any of them:")
+        print_job_lines(jobs)
+    else:
+        print("no jobs were running")
+
+
+def warn_before_restart(jobs):
+    """Say what the restart costs, then let it proceed. Never blocks and never prompts."""
+    if not jobs:
+        return
+    print(f"{len(jobs)} job{'' if len(jobs) == 1 else 's'} active. A restart does not stop "
+          "running jobs - each runs in its own session, so no signal from this command reaches "
+          "one:")
+    print_job_lines(jobs)
+    unsupervised = [j for j in jobs if j["job_pid"] is None]
+    if unsupervised:
+        print()
+        print(f"{len(unsupervised)} of those "
+              f"{'has' if len(unsupervised) == 1 else 'have'} no job pid recorded. If it was "
+              "submitted seconds ago that is momentary - the daemon folds in the supervisor's "
+              "record on its next reconciliation. If it is older, the job predates the per-job "
+              "supervisor: nothing is watching it exit, so it will record exit_code: null "
+              "whenever it finishes, restart or no restart.")
+    print()
+
+
+def daemon_restart():
+    """Stop the running daemon, start a fresh one, and confirm the new one is healthy."""
+    live = live_daemon()
+    warn_before_restart(active_jobs() if live else [])
+    if live is None:
+        print(f"no daemon was running for {STATE_DIR}")
+    else:
+        print(f"stopping daemon pid {live[0]} (port {live[1]})")
+        if not stop_daemon(live):
+            print(f"error: daemon pid {live[0]} did not exit; not starting a second one over it",
+                  file=sys.stderr)
+            sys.exit(1)
+    # Come back up on the port the daemon was actually serving. ensure_daemon() spawns jobd.py,
+    # which reads $JOBCTL_PORT and otherwise falls back to 8787 - so restarting a daemon that
+    # was started on a non-default port would silently move it, breaking any SSH tunnel or
+    # bookmark aimed at the old one. An explicit $JOBCTL_PORT still wins: that is the caller
+    # asking for a particular port rather than for continuity.
+    if live and "JOBCTL_PORT" not in os.environ:
+        os.environ["JOBCTL_PORT"] = str(live[1])
+    ensure_daemon()
+    new = live_daemon()
+    if new is None:
+        print("error: the new daemon did not come up healthy; check "
+              f"{os.path.join(STATE_DIR, 'daemon.log')}", file=sys.stderr)
+        sys.exit(1)
+    print(f"started daemon pid {new[0]} (port {new[1]})")
+
+
+DAEMON_SUBCOMMANDS = {
+    "status": daemon_status,
+    "restart": daemon_restart,
+    "stop": daemon_stop,
+}
+
+
+def cmd_daemon(args):
+    if not args or args[0] not in DAEMON_SUBCOMMANDS:
+        print("error: usage: jobctl daemon <status|restart|stop>", file=sys.stderr)
+        sys.exit(2)
+    if len(args) > 1:
+        print(f"error: unknown option {args[1]}", file=sys.stderr)
+        sys.exit(2)
+    DAEMON_SUBCOMMANDS[args[0]]()
 
 
 def parse_host(argv):
@@ -240,9 +671,19 @@ def ssh_argv(host, args):
     Every argument is shell-quoted because the remote command is re-parsed by the
     remote shell. `~/.local/bin` (where jobctl is symlinked) is prepended explicitly
     since a non-interactive `ssh host cmd` does not get the login shell's PATH.
+
+    A locally set JOBCTL_MAX_WAIT is forwarded as an assignment prefix. The blocking
+    happens on the remote jobctl, which reads its own environment, so without this the
+    ceiling the caller asked for would be silently replaced by the remote's default.
+    JOBCTL_STATE_DIR is deliberately *not* forwarded: it describes a local filesystem path
+    and a local daemon, whereas JOBCTL_MAX_WAIT describes the caller's own constraint and so
+    travels with the invocation. Sending it would aim the remote daemon at a directory that
+    means nothing — or something else entirely — over there.
     """
     remote = " ".join(shlex.quote(a) for a in ["jobctl"] + args)
-    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {remote}']
+    max_wait = os.environ.get("JOBCTL_MAX_WAIT", "")
+    prefix = f"JOBCTL_MAX_WAIT={shlex.quote(max_wait)} " if max_wait else ""
+    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {prefix}{remote}']
 
 
 def run_remote(host, args):
@@ -289,6 +730,7 @@ COMMANDS = {
     "stop": cmd_stop,
     "wait": cmd_wait,
     "ui": cmd_ui,
+    "daemon": cmd_daemon,
 }
 
 
@@ -307,7 +749,12 @@ def main():
         else:
             run_remote(host, argv)
         return
-    ensure_daemon()
+    if argv[0] != "daemon":
+        # `daemon` owns the daemon's lifecycle, so it must not be preceded by
+        # ensure_daemon(): `jobctl daemon status` would start a daemon in order to report
+        # that none was running, and `jobctl daemon stop` would start one just to stop it.
+        # cmd_daemon starts and stops the daemon itself, explicitly.
+        ensure_daemon()
     COMMANDS[argv[0]](argv[1:])
 
 

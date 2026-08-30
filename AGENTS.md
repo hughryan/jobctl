@@ -39,6 +39,13 @@ well-intentioned refactor breaks.
   between `jobctl` and the job, so there is no quoting or word-splitting layer to get wrong.
   Joining it into a string would introduce an injection and quoting surface that does not
   currently exist.
+- **One writer per file: the daemon owns `meta.json`; the supervisor owns `supervisor.json` and
+  the log.** The daemon folds the supervisor's record into `meta.json` during reconciliation; the
+  supervisor never touches `meta.json`, and the daemon never writes `supervisor.json`. Writes are
+  atomic (tmp + `os.replace`), so single-writer means no cross-process locking is needed at all.
+  "Why not have the supervisor update `meta.json` directly?" looks like a simplification and
+  reintroduces a read-modify-write race — e.g. `stop_job`'s `status: "stopping"` landing after the
+  supervisor's `exited` and stranding the job as "stopping" forever.
 - **The daemon binds `127.0.0.1` only.** It has no authentication and assumes a single local
   user. Multi-machine use goes through SSH via `--host`, which keeps authentication in SSH
   where it belongs. Never bind another interface or add a network-exposed mode.
@@ -64,6 +71,12 @@ Before committing:
 - If you touched `--host`: the remote path cannot be tested end-to-end without a reachable
   host. Test command construction directly instead, and explicitly assert that `ensure_daemon`
   is never called when `--host` is set. Say plainly in your report what remains unverified.
+- **Prefer testing against the running daemon.** When you genuinely need an isolated one, set
+  `JOBCTL_STATE_DIR` to a scratch directory — that gives the daemon its own `daemon.port`,
+  `daemon.pid`, `daemon.log` and `jobs/`, and the CLI reads the same variable, so nothing you
+  do touches the user's `~/.jobctl/`. `JOBCTL_PORT` alone is **not** isolation: it changes
+  which port gets recorded in the shared `daemon.port`, not which file gets written, so it
+  redirects the user's own CLI to your throwaway daemon.
 
 ## What NOT to touch
 
