@@ -221,6 +221,29 @@ To use a different port, set `JOBCTL_PORT` for both the daemon and the CLI (the 
 the running daemon recorded in `~/.jobctl/daemon.port`, so in practice you set it once and restart
 the daemon).
 
+### `JOBCTL_STATE_DIR`
+
+`JOBCTL_STATE_DIR` moves that bookkeeping directory somewhere else. Point it at a scratch path and
+you get a completely independent daemon — its own `daemon.port`, `daemon.pid`, `daemon.log` and
+`jobs/` — whose jobs are invisible to your usual `jobctl`, and which cannot see your usual jobs
+either. That is what you want for testing a change to `jobctl` itself, or for keeping one project's
+jobs off the main list:
+
+```bash
+JOBCTL_STATE_DIR=/tmp/jobctl-scratch JOBCTL_PORT=8799 jobctl list
+```
+
+Setting it on the CLI is enough: the daemon the CLI starts inherits the environment. It is not
+forwarded over `--host`, since a local directory path means nothing on another machine.
+
+`JOBCTL_PORT` alone is not isolation. It changes which port gets recorded in `daemon.port`, not
+which file gets written, so a second daemon started that way would quietly redirect the CLI your
+real jobs are running under, and leave it pointing at a dead port once you killed it. Two things
+now prevent that: a daemon refuses to start if another live daemon already owns its state directory
+(the recorded pid must be alive *and* the recorded port must answer a health check, so a stale pid
+file does not lock you out), and it binds its port before writing the port file, so a start that
+fails on an in-use port leaves the working daemon's state untouched.
+
 ### `JOBCTL_MAX_WAIT`
 
 `JOBCTL_MAX_WAIT` caps how long any single `jobctl` invocation blocks — both `jobctl wait` and

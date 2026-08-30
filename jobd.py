@@ -2,9 +2,9 @@
 """Local job daemon: run detached long-running commands, track status, tail logs, stop them.
 
 Bound to 127.0.0.1 only — not for remote/multi-user use. State lives on disk under
-~/.jobctl/jobs/<id>/ (meta.json + log) so it survives daemon restarts; a background
-watcher reconciles process liveness so nothing goes untracked if the daemon itself
-gets restarted while jobs are running.
+$JOBCTL_STATE_DIR/jobs/<id>/ (default ~/.jobctl) as meta.json + log, so it survives daemon
+restarts; a background watcher reconciles process liveness so nothing goes untracked if the
+daemon itself gets restarted while jobs are running.
 """
 import json
 import os
@@ -13,17 +13,22 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-STATE_DIR = os.path.expanduser("~/.jobctl")
+# $JOBCTL_STATE_DIR gives a daemon its own port file, pid file, log and jobs — everything
+# that makes one instance distinct from another. Setting $JOBCTL_PORT alone does not: the
+# port is still recorded in the shared directory, so a second daemon would redirect the CLI
+# that the first one's jobs belong to.
+STATE_DIR = os.path.expanduser(os.environ.get("JOBCTL_STATE_DIR") or "~/.jobctl")
 JOBS_DIR = os.path.join(STATE_DIR, "jobs")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 STOP_GRACE_SECS = 10
 
-os.makedirs(JOBS_DIR, exist_ok=True)
+os.makedirs(JOBS_DIR, exist_ok=True)  # creates STATE_DIR too, wherever it points
 
 lock = threading.Lock()
 popens = {}  # job_id -> subprocess.Popen, only for jobs launched by this daemon instance
@@ -210,7 +215,9 @@ class Handler(BaseHTTPRequestHandler):
             tail = int(qs.get("tail", ["200"])[0])
             with open(log_path, "rb") as f:
                 data = f.read().decode(errors="replace")
-            lines = data.splitlines()[-tail:]
+            # Not `[-tail:]`: `[-0:]` is the whole list, which would turn `--tail 0` into
+            # "everything" when the caller asked for nothing.
+            lines = data.splitlines()[-tail:] if tail > 0 else []
             return self._text(200, "\n".join(lines))
 
         # static UI
@@ -256,15 +263,56 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
+def live_daemon():
+    """Return (pid, port) of a daemon already serving STATE_DIR, or None if the state is stale.
+
+    Two independent signals must agree before we call the directory occupied: the recorded pid
+    is alive *and* the recorded port answers a health check. A live pid alone is not enough —
+    pid numbers get recycled, so a stale daemon.pid whose number an unrelated process inherited
+    would wedge this state directory shut forever, which is worse than the takeover it prevents.
+    Anything missing, unreadable or unresponsive therefore means stale: proceed and take over.
+    """
+    try:
+        with open(os.path.join(STATE_DIR, "daemon.pid")) as f:
+            pid = int(f.read().strip())
+        with open(os.path.join(STATE_DIR, "daemon.port")) as f:
+            port = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if not pid_alive(pid):
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as resp:
+            if resp.status != 200 or not json.loads(resp.read()).get("ok"):
+                return None
+    except Exception:
+        return None
+    return pid, port
+
+
 def main():
+    owner = live_daemon()
+    if owner:
+        print(f"error: a jobd daemon (pid {owner[0]}) is already serving {STATE_DIR} on port "
+              f"{owner[1]}; set JOBCTL_STATE_DIR to a scratch directory to run an isolated one",
+              file=sys.stderr)
+        return 1
+
+    # Bind before recording anything. daemon.port is the pointer every CLI follows, so a start
+    # that dies on an in-use port must not have overwritten a working daemon's on its way out.
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as exc:
+        print(f"error: could not bind 127.0.0.1:{PORT} ({exc}); set JOBCTL_PORT to a free port, "
+              "and JOBCTL_STATE_DIR too if you want an independent daemon", file=sys.stderr)
+        return 1
+
     with open(os.path.join(STATE_DIR, "daemon.port"), "w") as f:
         f.write(str(PORT))
     with open(os.path.join(STATE_DIR, "daemon.pid"), "w") as f:
         f.write(str(os.getpid()))
 
     threading.Thread(target=watcher_loop, daemon=True).start()
-
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.serve_forever()
 
 

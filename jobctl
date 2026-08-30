@@ -23,7 +23,10 @@ import time
 import urllib.error
 import urllib.request
 
-STATE_DIR = os.path.expanduser("~/.jobctl")
+# $JOBCTL_STATE_DIR selects which daemon this CLI talks to, by selecting which daemon.port
+# it reads. It is inherited by the daemon ensure_daemon() spawns, so pointing it at a scratch
+# directory gives a fully independent instance — its own port, pid, log and jobs.
+STATE_DIR = os.path.expanduser(os.environ.get("JOBCTL_STATE_DIR") or "~/.jobctl")
 DAEMON_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jobd.py")
 DEFAULT_PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 UI_FORWARD_PORT = 8788
@@ -70,6 +73,8 @@ def ensure_daemon():
     os.makedirs(STATE_DIR, exist_ok=True)
     log_path = os.path.join(STATE_DIR, "daemon.log")
     with open(log_path, "ab") as logf:
+        # No env= : the daemon inherits os.environ, so JOBCTL_STATE_DIR and JOBCTL_PORT
+        # reach it without being plumbed through explicitly.
         subprocess.Popen(
             [sys.executable, DAEMON_SRC],
             stdin=subprocess.DEVNULL,
@@ -84,7 +89,7 @@ def ensure_daemon():
             return
         except (urllib.error.URLError, ConnectionRefusedError, OSError):
             continue
-    print("error: jobd daemon did not come up; check ~/.jobctl/daemon.log", file=sys.stderr)
+    print(f"error: jobd daemon did not come up; check {log_path}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -357,6 +362,10 @@ def ssh_argv(host, args):
     A locally set JOBCTL_MAX_WAIT is forwarded as an assignment prefix. The blocking
     happens on the remote jobctl, which reads its own environment, so without this the
     ceiling the caller asked for would be silently replaced by the remote's default.
+    JOBCTL_STATE_DIR is deliberately *not* forwarded: it describes a local filesystem path
+    and a local daemon, whereas JOBCTL_MAX_WAIT describes the caller's own constraint and so
+    travels with the invocation. Sending it would aim the remote daemon at a directory that
+    means nothing — or something else entirely — over there.
     """
     remote = " ".join(shlex.quote(a) for a in ["jobctl"] + args)
     max_wait = os.environ.get("JOBCTL_MAX_WAIT", "")
