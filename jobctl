@@ -3,7 +3,7 @@
 
 Usage:
   jobctl submit [--name NAME] [--cwd DIR] -- <command> [args...]
-  jobctl list
+  jobctl list [--all | --since DURATION]
   jobctl status <id>
   jobctl logs <id> [--tail N] [--follow]
   jobctl stop <id>
@@ -27,6 +27,9 @@ STATE_DIR = os.path.expanduser("~/.jobctl")
 DAEMON_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jobd.py")
 DEFAULT_PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 UI_FORWARD_PORT = 8788
+LIST_DEFAULT_WINDOW_SECS = 86400
+ACTIVE_STATUSES = ("running", "stopping")
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def base_url():
@@ -114,17 +117,74 @@ def cmd_submit(args):
     print(result["id"])
 
 
+def parse_duration(text):
+    """Parse `<number><unit>` (unit s/m/h/d, a bare number meaning seconds) into seconds.
+
+    Returns None for anything unparseable, so the caller reports its own error message.
+    """
+    unit = DURATION_UNITS.get(text[-1:])
+    try:
+        value = float(text[:-1] if unit else text)
+    except ValueError:
+        return None
+    return value * (unit or 1)
+
+
 def cmd_list(args):
+    """List jobs from the last 24h by default, plus every active job whatever its age.
+
+    A long-lived daemon accumulates hundreds of finished jobs, and printing all of them
+    buries the few that matter. Active jobs are exempt from the window because a job that
+    is still running must never be absent from this table merely because it started days
+    ago. `--all` and `--since` both set the same window, so the last one given wins.
+    """
+    window = LIST_DEFAULT_WINDOW_SECS
+    i = 0
+    while i < len(args):
+        if args[i] == "--all":
+            window = None
+            i += 1
+        elif args[i] == "--since":
+            window = parse_duration(args[i + 1] if i + 1 < len(args) else "")
+            if window is None:
+                print("error: --since expects a duration like 30m, 2h, 7d", file=sys.stderr)
+                sys.exit(2)
+            i += 2
+        else:
+            print(f"error: unknown option {args[i]}", file=sys.stderr)
+            sys.exit(2)
+
     jobs = request("GET", "/api/jobs")
     if not jobs:
         print("(no jobs)")
         return
-    print(f"{'ID':<28} {'STATUS':<10} {'RUNTIME':<8} CMD")
-    for j in jobs:
-        end = j["ended_at"] or time.time()
-        runtime = fmt_duration(end - j["started_at"])
-        cmd_str = " ".join(j["cmd"])
-        print(f"{j['id']:<28} {j['status']:<10} {runtime:<8} {cmd_str[:80]}")
+    cutoff = None if window is None else time.time() - window
+    shown = [j for j in jobs
+             if j["status"] in ACTIVE_STATUSES or cutoff is None or j["started_at"] >= cutoff]
+    hidden = len(jobs) - len(shown)
+
+    if not shown:
+        print("(no recent jobs)")
+    else:
+        # The id is a handle the caller copy-pastes, so its column grows to fit instead of
+        # truncating. The command cell collapses whitespace so a multi-line command (a
+        # heredoc, say) stays one row rather than spilling its body into the table.
+        id_w = max(12, max(len(j["id"]) for j in shown))
+        print(f"{'ID':<{id_w}} {'STATUS':<8} {'RUNTIME':<8} CMD")
+        for j in shown:
+            end = j["ended_at"] or time.time()
+            runtime = fmt_duration(end - j["started_at"])
+            cmd_str = " ".join(" ".join(j["cmd"]).split())
+            if len(cmd_str) > 80:
+                cmd_str = cmd_str[:80] + "…"
+            print(f"{j['id']:<{id_w}} {j['status']:<8} {runtime:<8} {cmd_str}")
+
+    if hidden:
+        # The hint names bare flags rather than a full `jobctl list ...` command: this code
+        # also runs on the far side of an SSH hop for `jobctl --host <alias> list`, where a
+        # copy-pasteable command line would wrongly target the local daemon.
+        print()
+        print(f"{hidden} older job{'' if hidden == 1 else 's'} hidden — use --all or --since 7d")
 
 
 def cmd_status(args):

@@ -16,7 +16,7 @@ Use it whenever a task:
 
 ```bash
 jobctl submit [--name NAME] [--cwd DIR] -- <any command and args>   # returns a job id immediately
-jobctl list                                                          # table of all jobs + status
+jobctl list [--all] [--since DURATION]                               # table of jobs + status: last 24h plus every active job
 jobctl status <id>                                                   # full JSON: status, pid, exit_code, timestamps
 jobctl logs <id> [--tail N] [--follow]                               # read or tail combined stdout+stderr
 jobctl stop <id>                                                     # SIGTERM, escalates to SIGKILL after 10s
@@ -24,6 +24,8 @@ jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]                # block unt
 jobctl ui                                                            # prints the dashboard URL (http://127.0.0.1:8787)
 jobctl --host <ssh-alias> <any of the above>                         # run that command on a remote machine over SSH
 ```
+
+`jobctl list` deliberately shows only the last 24 hours of jobs plus every job still `running` or `stopping`, so a long-lived daemon's hundreds of finished jobs don't flood the output - a running job is never hidden, however old it is. Widen the window with `--since 7d` (`s`/`m`/`h`/`d`, a bare number meaning seconds) or drop it with `--all`; a footer tells you how many rows were hidden. `jobctl status <id>` still works for any job, hidden or not.
 
 The daemon auto-starts on first use of any `jobctl` command - no setup required. It binds to `127.0.0.1` only. `--cwd` is passed straight to the daemon as structured data (not shell-interpreted), so it's the way to run a job in a specific directory without a `cd &&` shell construct - useful since some harness guards refuse "complex" multi-part commands and worktree-pinned sessions can't always `cd` into an arbitrary path.
 

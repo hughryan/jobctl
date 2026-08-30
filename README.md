@@ -18,8 +18,8 @@ $ jobctl submit --name train -- python train.py --config run-1.yaml
 train-9f3c1a02
 
 $ jobctl list
-ID                           STATUS     RUNTIME  CMD
-train-9f3c1a02               running    4m12s    python train.py --config run-1.yaml
+ID              STATUS   RUNTIME  CMD
+train-9f3c1a02  running  4m12s    python train.py --config run-1.yaml
 
 $ jobctl logs train-9f3c1a02 --tail 3
 epoch 12/50  loss 0.4417
@@ -224,7 +224,7 @@ the daemon).
 | Command | What it does |
 | --- | --- |
 | `jobctl submit [--name NAME] [--cwd DIR] -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. |
-| `jobctl list` | Table of all jobs: id, status, runtime, command. |
+| `jobctl list [--all] [--since DURATION]` | Table of jobs — id, status, runtime, command. Shows the last 24 hours plus every still-active job; `--since 7d` widens the window (`s`/`m`/`h`/`d`, bare number = seconds), `--all` drops it. |
 | `jobctl status <id>` | Full JSON for one job: status, pid, exit code, timestamps, cwd, command. |
 | `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` streams until the job ends. |
 | `jobctl stop <id>` | `SIGTERM` the job's process group, escalating to `SIGKILL` after 10 seconds. |
@@ -252,10 +252,17 @@ See what is running:
 
 ```bash
 $ jobctl list
-ID                           STATUS     RUNTIME  CMD
-build-1c4de8a7               running    38s      make -j8 all
-train-9f3c1a02               exited     1h12m    python train.py --config run-1.yaml
+ID              STATUS   RUNTIME  CMD
+build-1c4de8a7  running  38s      make -j8 all
+train-9f3c1a02  exited   1h12m    python train.py --config run-1.yaml
+
+121 older jobs hidden — use --all or --since 7d
 ```
+
+`list` shows the last 24 hours plus everything still active, because a daemon that has been up
+for weeks accumulates hundreds of finished jobs and printing all of them buries the few that
+matter. A running job is never hidden, however old it is. Widen the window with `--since 7d`, or
+drop it entirely with `--all`.
 
 Look at recent output, or follow it live:
 
