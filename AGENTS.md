@@ -11,6 +11,7 @@ jobctl                  # CLI — talks to the daemon over HTTP, or to a remote 
 jobd.py                 # daemon — owns jobs, tracks state, serves the JSON API + dashboard
 static/index.html       # single-page dashboard served by the daemon
 skills/jobctl/SKILL.md  # Claude Code skill — teaches an agent when and how to use the tool
+tests/test_jobctl.py    # test suite — one test per invariant, plus golden records in fixtures/
 README.md               # human-facing docs: the problem, the design, full usage
 AGENTS.md               # this file (CLAUDE.md symlinks here)
 ```
@@ -89,18 +90,40 @@ Any change to CLI behavior, flags, or defaults must be reflected in **both**:
 
 Before committing:
 
-- `python3 -m py_compile jobctl jobd.py` passes.
+- `python3 tests/test_jobctl.py` passes. The suite is one file, stdlib `unittest` only, and
+  every invocation in it runs against its own throwaway daemon — it never reads or writes the
+  user's `~/.jobctl/`, and it leaves no daemon behind even when a test fails. There is one
+  test per invariant above, named so that a failure says which invariant broke.
+- `python3 -m py_compile jobctl jobd.py tests/test_jobctl.py` passes.
 - Local smoke test against the real daemon: `submit` a trivial job, then `list`, `status`,
   `logs`, `wait`, `stop`. The daemon auto-starts, so no setup is needed.
-- If you touched `--host`: the remote path cannot be tested end-to-end without a reachable
-  host. Test command construction directly instead, and explicitly assert that `ensure_daemon`
-  is never called when `--host` is set. Say plainly in your report what remains unverified.
+- If you touched `--host`: the remote path *is* testable without a reachable host. The suite
+  puts a fake `ssh` on `PATH` that records its argv and honours `-n`, which covers command
+  construction, the `-n`, verbatim exit-code propagation, and — by asserting no `daemon.pid`,
+  `daemon.port`, `daemon.log` or `jobs/` appears in a fresh state directory — the guarantee
+  that a `--host` invocation never reaches `ensure_daemon()`. Extend `TestInvariants` rather
+  than reasoning about the remote path in your head. What genuinely remains unverified is only
+  the far side: that a real remote `jobctl` does the right thing with the command it receives.
+  Say so plainly in your report.
 - **Prefer testing against the running daemon.** When you genuinely need an isolated one, set
-  `JOBCTL_STATE_DIR` to a scratch directory — that gives the daemon its own `daemon.port`,
-  `daemon.pid`, `daemon.log` and `jobs/`, and the CLI reads the same variable, so nothing you
-  do touches the user's `~/.jobctl/`. `JOBCTL_PORT` alone is **not** isolation: it changes
-  which port gets recorded in the shared `daemon.port`, not which file gets written, so it
-  redirects the user's own CLI to your throwaway daemon.
+  **both** `JOBCTL_STATE_DIR` and `JOBCTL_PORT` — an isolated daemon needs its own files *and*
+  its own socket, and neither variable implies the other. `JOBCTL_STATE_DIR` gives the daemon
+  its own `daemon.port`, `daemon.pid`, `daemon.log` and `jobs/`, and the CLI reads the same
+  variable, so nothing you do touches the user's `~/.jobctl/` — but `jobd.py` still reads
+  `JOBCTL_PORT` (default `8787`) and binds it, so on a machine where the user's daemon already
+  holds `8787` your daemon dies with "address already in use" and the CLI spins for five
+  seconds and exits 1. `JOBCTL_PORT` alone is **not** isolation either, and is worse: it
+  changes which port gets recorded in the shared `daemon.port`, not which file gets written,
+  so it redirects the user's own CLI to your throwaway daemon. Bind port 0, read the port back,
+  and pass it alongside a `mkdtemp()` state dir, as `isolated_env()` in the suite does.
+- **Test the new code against an artifact produced before your change.** When you change the
+  shape of a persisted record or the shape of an invocation, a state directory your test just
+  created cannot falsify it: every record in one was written by the code under test, and every
+  argv in one was synthesised by the test. Plant a real old `meta.json` (there are golden ones
+  in `tests/fixtures/`) and reproduce the real invocation context (a stdin-fed script, not just
+  an argv list). Three separate bugs shipped past clean-room testing this way — a `KeyError`
+  on a record predating a field, and an `ssh` without `-n` that ate the rest of its caller's
+  script, which no flag-level test could see because the argv was identical either way.
 
 ## What NOT to touch
 
@@ -108,3 +131,11 @@ Before committing:
   repository content.
 - Commit identity. Never set `user.name`/`user.email` or `GIT_AUTHOR_*`/`GIT_COMMITTER_*`;
   use whatever git resolves. Never add `Co-Authored-By` trailers.
+- Local system detail, in anything checked in. This is a public repository, so no file here may
+  carry an absolute path containing a username, a hostname, an ssh alias, or a job record copied
+  out of somebody's own `~/.jobctl`. Test fixtures are where this goes wrong, because the honest
+  instinct is right: a realistic old `meta.json` has to come from a real one, or it proves
+  nothing. Capture the *shape* from real state — which keys exist, and which do not — then
+  replace the values with generic ones. Documentation examples need the same care: a pasted
+  terminal transcript is a real transcript, and the job names in it are somebody's real work.
+  The keys are what the tests turn on; the values are only ever illustration.

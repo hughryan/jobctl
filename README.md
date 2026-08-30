@@ -526,7 +526,7 @@ The command says what is running before it touches anything:
 ```
 $ jobctl daemon restart
 2 jobs active. A restart does not stop running jobs - each runs in its own session, so no signal from this command reaches one:
-  smart-hunt-v2-8f1a9e57 running  job pid (none recorded)
+  log-rotate-v2-4d7b0c21 running  job pid (none recorded)
   nightly-build-3c02aa17 running  job pid 51188
 
 1 of those has no job pid recorded. If it was submitted seconds ago that is momentary - the daemon
@@ -584,6 +584,19 @@ any agent involved; the skill is just how you hand that usefulness to one.
   and ten jobs start. That is intentional — it is a job *runner*, not a job *scheduler*.
 - **Old jobs accumulate.** Nothing prunes `~/.jobctl/jobs/`. Delete directories under it whenever the
   history gets long; the daemon will not miss them.
+
+## Development
+
+```bash
+python3 tests/test_jobctl.py          # or: python3 -m unittest discover tests
+```
+
+The suite is a single file using the standard library's `unittest` — no dependencies, same as the
+tool. Each test runs against a throwaway daemon isolated by two environment variables, both of which
+are required: `JOBCTL_STATE_DIR` points the files (`daemon.pid`, `daemon.port`, `jobs/`) at a
+scratch directory, and `JOBCTL_PORT` gives that daemon a free port to bind instead of the default
+`8787`. Nothing in the suite reads or writes your real `~/.jobctl`, and no test daemon or job
+outlives the run.
 
 ## License
 
