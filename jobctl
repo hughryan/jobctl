@@ -127,6 +127,21 @@ def fmt_duration(secs):
     return f"{s}s"
 
 
+def submit_opt_value(opts, i):
+    """The value following the flag at opts[i], rejecting a missing or empty one.
+
+    A trailing flag would otherwise index past the end of the list and surface as an
+    IndexError traceback. An empty value is rejected rather than ignored, on the same
+    reasoning as `--host`: `--cwd "$UNSET_VAR"` must fail loudly instead of quietly
+    launching the job somewhere other than where it was meant to run.
+    """
+    value = opts[i + 1] if i + 1 < len(opts) else ""
+    if not value:
+        print(f"error: {opts[i]} expects a value", file=sys.stderr)
+        sys.exit(2)
+    return value
+
+
 def cmd_submit(args):
     if "--" not in args:
         print("error: expected `--` before the command, e.g. jobctl submit --name run-1 -- python train.py", file=sys.stderr)
@@ -140,17 +155,17 @@ def cmd_submit(args):
     i = 0
     while i < len(opts):
         if opts[i] == "--name":
-            name = opts[i + 1]
+            name = submit_opt_value(opts, i)
             i += 2
         elif opts[i] == "--cwd":
-            cwd = opts[i + 1]
+            cwd = submit_opt_value(opts, i)
             i += 2
         elif opts[i] == "--env":
             # Split on the first `=` only, so a value may itself contain `=`. An empty value
             # is legal and meaningful: `--env PYTHONUNBUFFERED=` opts out of that default,
             # because the supervisor applies these last and Python honours only a non-empty
             # value. Repeatable; the last assignment to a key wins, as with `--since`.
-            key, sep_eq, value = (opts[i + 1] if i + 1 < len(opts) else "").partition("=")
+            key, sep_eq, value = submit_opt_value(opts, i).partition("=")
             if not sep_eq or not key:
                 print("error: --env expects KEY=VALUE with a non-empty KEY", file=sys.stderr)
                 sys.exit(2)
