@@ -64,6 +64,13 @@ Before committing:
 - If you touched `--host`: the remote path cannot be tested end-to-end without a reachable
   host. Test command construction directly instead, and explicitly assert that `ensure_daemon`
   is never called when `--host` is set. Say plainly in your report what remains unverified.
+- **Never start a second daemon to test against, and do not reach for `JOBCTL_PORT` to make
+  one "safe".** `main()` in `jobd.py` writes `daemon.port` into the shared `~/.jobctl/`, and
+  `base_url()` in `jobctl` reads that file to find the daemon — so a throwaway daemon on
+  another port rewrites the pointer the user's own CLI follows, silently redirecting it, and
+  leaves it dangling when the test daemon is killed. `JOBCTL_PORT` changes which port gets
+  recorded, not whether it gets recorded. Test against the running daemon; if you need an
+  isolated one, point `STATE_DIR`/`JOBS_DIR` at a scratch copy instead.
 
 ## What NOT to touch
 

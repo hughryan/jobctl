@@ -138,7 +138,8 @@ while ! jobctl wait "$JOB_ID" --timeout 540; do :; done
 
 The 540-second default is deliberately just under the 600-second ceiling that a typical harness puts
 on a single shell call, so the wait returns on its own terms rather than being hard-killed from
-above.
+above. A longer `--timeout` is clamped to `JOBCTL_MAX_WAIT` (45 minutes by default) for a reason
+that has nothing to do with the job — see [`JOBCTL_MAX_WAIT`](#jobctl_max_wait).
 
 **Remote hosts are first-class.** A leading `--host <ssh-alias>` re-runs *any* subcommand on that
 machine over SSH — same CLI, same flags, same exit codes, output streamed live. Importantly, a
@@ -220,6 +221,26 @@ To use a different port, set `JOBCTL_PORT` for both the daemon and the CLI (the 
 the running daemon recorded in `~/.jobctl/daemon.port`, so in practice you set it once and restart
 the daemon).
 
+### `JOBCTL_MAX_WAIT`
+
+`JOBCTL_MAX_WAIT` caps how long any single `jobctl` invocation blocks — both `jobctl wait` and
+`jobctl logs --follow`. It defaults to 2700 seconds (45 minutes) and takes the same duration syntax
+as `--since`, so `JOBCTL_MAX_WAIT=45m` and `JOBCTL_MAX_WAIT=2700` are the same thing. A malformed
+value warns on stderr and falls back to the default rather than failing the command.
+
+That number is not about anything inside `jobctl`. It is sized against the *caller's* prompt cache:
+an AI coding agent's cached context has a 60-minute TTL that is refreshed on each API request the
+session makes, and it makes none while blocked inside a single tool call. Block for longer than the
+TTL and the session's entire context — often hundreds of thousands of tokens — is re-read cold. 45
+minutes leaves margin for the tool return and the model turn that follow the block.
+
+A `--timeout` larger than the cap is clamped, with a note on stderr so the JSON on stdout stays
+parseable. Exit codes are unaffected: a clamped wait that expires is an ordinary timeout, so the
+documented `while ! jobctl wait "$JOB_ID"; do :; done` loop simply wakes up and re-blocks more
+often — which is the point. Raise the value if you
+want longer blocks; nothing here imposes an upper bound. With `--host`, a locally set value is
+forwarded to the remote `jobctl`, which would otherwise silently apply its own default.
+
 ### Commands
 
 | Command | What it does |
@@ -227,9 +248,9 @@ the daemon).
 | `jobctl submit [--name NAME] [--cwd DIR] -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. |
 | `jobctl list [--all] [--since DURATION]` | Table of jobs — id, status, runtime, command. Shows the last 24 hours plus every still-active job; `--since 7d` widens the window (`s`/`m`/`h`/`d`, bare number = seconds), `--all` drops it. |
 | `jobctl status <id>` | Full JSON for one job: status, pid, exit code, timestamps, cwd, command. |
-| `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` streams until the job ends. |
+| `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` prints those last lines, then streams new output until the job ends (exit 0) or `JOBCTL_MAX_WAIT` elapses (exit 1 — resume with `--follow --tail 0`). |
 | `jobctl stop <id>` | `SIGTERM` the job's process group, escalating to `SIGKILL` after 10 seconds. |
-| `jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]` | Block until terminal state or timeout. Defaults: 540s timeout, 2s poll. Exit 0 = done, exit 1 = timed out. |
+| `jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]` | Block until terminal state or timeout. Defaults: 540s timeout, 2s poll; a longer `--timeout` is clamped to `JOBCTL_MAX_WAIT` (45 minutes). Exit 0 = done, exit 1 = timed out. |
 | `jobctl ui` | Print the dashboard URL. |
 | `jobctl --host <ssh-alias> <any of the above>` | Run that command on a remote machine over SSH. |
 
@@ -269,7 +290,8 @@ Look at recent output, or follow it live:
 
 ```bash
 $ jobctl logs build-1c4de8a7 --tail 20
-$ jobctl logs build-1c4de8a7 --follow      # streams until the job reaches a terminal state
+$ jobctl logs build-1c4de8a7 --follow      # last 200 lines, then streams until the job ends
+$ jobctl logs build-1c4de8a7 --follow --tail 0   # new output only — the way to resume a follow
 ```
 
 Wait for it, then act on the result:

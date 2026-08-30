@@ -28,6 +28,13 @@ DAEMON_SRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jobd.py"
 DEFAULT_PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 UI_FORWARD_PORT = 8788
 LIST_DEFAULT_WINDOW_SECS = 86400
+# Ceiling on how long any single jobctl invocation blocks, overridable with $JOBCTL_MAX_WAIT.
+# It is sized against the *caller's* prompt-cache TTL, not anything internal to jobctl: an AI
+# agent's cache entry lives 60 minutes and is refreshed on each request it makes, and it makes
+# none while blocked inside one tool call. Blocking past that window throws away a whole
+# session's cached context. 45 minutes leaves margin for the tool return and the model turn
+# that follow the block.
+DEFAULT_MAX_WAIT_SECS = 2700.0
 ACTIVE_STATUSES = ("running", "stopping")
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -130,6 +137,25 @@ def parse_duration(text):
     return value * (unit or 1)
 
 
+def max_wait_secs():
+    """Resolve the blocking ceiling from $JOBCTL_MAX_WAIT, in the same syntax as `--since`.
+
+    Resolved per call rather than at import so a malformed value is reported only by the
+    commands that actually block, instead of by every unrelated `jobctl list`. A bad value
+    warns and falls back to the default rather than exiting: a typo in an environment
+    variable must not take job control away from the caller.
+    """
+    raw = os.environ.get("JOBCTL_MAX_WAIT", "")
+    if not raw:
+        return DEFAULT_MAX_WAIT_SECS
+    secs = parse_duration(raw)
+    if secs is None or secs <= 0:
+        print(f"warning: ignoring JOBCTL_MAX_WAIT={raw!r} — expected a positive duration like "
+              f"45m, 2700; using {DEFAULT_MAX_WAIT_SECS:g}s", file=sys.stderr)
+        return DEFAULT_MAX_WAIT_SECS
+    return secs
+
+
 def cmd_list(args):
     """List jobs from the last 24h by default, plus every active job whatever its age.
 
@@ -217,16 +243,32 @@ def cmd_logs(args):
         print(request("GET", f"/api/jobs/{job_id}/log?tail={tail}"))
         return
 
-    seen = 0
+    # Following starts from the last `tail` lines, like `tail -f`, rather than replaying the
+    # whole log: on a long-running job that first dump is enormous, and it would be repeated
+    # every time a caller resumes. `--tail 0` is therefore the resume mode - new output only.
+    # Following is also bounded by the same ceiling as `wait`, and reports a timeout the same
+    # way (exit 1), so `while ! jobctl logs <id> --follow --tail 0; do :; done` resumes cleanly
+    # and an elapsed window is never mistaken for the job having finished.
+    max_wait = max_wait_secs()
+    deadline = time.time() + max_wait
+    seen = None
     while True:
         text = request("GET", f"/api/jobs/{job_id}/log?tail=100000")
         lines = text.splitlines() if text else []
-        for line in lines[seen:]:
+        start = len(lines) - max(tail, 0) if seen is None else seen
+        for line in lines[max(start, 0):]:
             print(line)
         seen = len(lines)
         meta = request("GET", f"/api/jobs/{job_id}")
-        if meta["status"] not in ("running", "stopping"):
+        if meta["status"] not in ACTIVE_STATUSES:
             break
+        if time.time() >= deadline:
+            # Bare flags rather than a copy-pasteable command line: this code also runs on the
+            # far side of an SSH hop, where the id means nothing to the local daemon.
+            print(f"note: stopped following after {max_wait:g}s (JOBCTL_MAX_WAIT); the job is "
+                  "still running — resume with --follow --tail 0 for new output only",
+                  file=sys.stderr)
+            sys.exit(1)
         time.sleep(1)
 
 
@@ -243,6 +285,10 @@ def cmd_wait(args):
     timeout elapses, instead of the caller re-invoking a tool call every poll tick.
     Default timeout (540s) sits under Bash's default 600s max-timeout ceiling so this
     always returns cleanly rather than getting hard-killed by the caller's own timeout.
+
+    A larger `--timeout` is clamped to max_wait_secs(); the exit-code contract is unchanged,
+    so a clamped wait that expires is an ordinary timeout and the documented
+    `while ! jobctl wait ...; do :; done` loop simply wakes up and re-blocks more often.
     """
     if not args:
         print("error: usage: jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]", file=sys.stderr)
@@ -260,6 +306,13 @@ def cmd_wait(args):
         else:
             print(f"error: unknown option {args[i]}", file=sys.stderr)
             sys.exit(2)
+
+    max_wait = max_wait_secs()
+    if timeout > max_wait:
+        # stderr, so the JSON on stdout stays parseable by the caller.
+        print(f"note: --timeout {timeout:g} clamped to {max_wait:g}s (JOBCTL_MAX_WAIT); "
+              "the wait loop will resume", file=sys.stderr)
+        timeout = max_wait
 
     deadline = time.time() + timeout
     while True:
@@ -300,9 +353,15 @@ def ssh_argv(host, args):
     Every argument is shell-quoted because the remote command is re-parsed by the
     remote shell. `~/.local/bin` (where jobctl is symlinked) is prepended explicitly
     since a non-interactive `ssh host cmd` does not get the login shell's PATH.
+
+    A locally set JOBCTL_MAX_WAIT is forwarded as an assignment prefix. The blocking
+    happens on the remote jobctl, which reads its own environment, so without this the
+    ceiling the caller asked for would be silently replaced by the remote's default.
     """
     remote = " ".join(shlex.quote(a) for a in ["jobctl"] + args)
-    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {remote}']
+    max_wait = os.environ.get("JOBCTL_MAX_WAIT", "")
+    prefix = f"JOBCTL_MAX_WAIT={shlex.quote(max_wait)} " if max_wait else ""
+    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {prefix}{remote}']
 
 
 def run_remote(host, args):
