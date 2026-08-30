@@ -9,6 +9,7 @@ Usage:
   jobctl stop <id>
   jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]
   jobctl ui
+  jobctl daemon <status|restart|stop>
 
 A leading --host <ssh-alias> runs any of the above on that host over SSH instead of
 locally. The local daemon is never started or contacted in that case:
@@ -17,6 +18,7 @@ locally. The local daemon is never started or contacted in that case:
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -39,6 +41,10 @@ LIST_DEFAULT_WINDOW_SECS = 86400
 # that follow the block.
 DEFAULT_MAX_WAIT_SECS = 2700.0
 ACTIVE_STATUSES = ("running", "stopping")
+# How long `daemon stop`/`daemon restart` waits for a SIGTERMed daemon to exit before
+# escalating to SIGKILL. The daemon has nothing to flush on the way out - jobs and their
+# logs belong to the supervisors - so a few seconds is generous.
+DAEMON_STOP_GRACE_SECS = 5.0
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -354,6 +360,296 @@ def cmd_ui(args):
     print(base_url())
 
 
+def read_daemon_files():
+    """Return the (pid, port) recorded in STATE_DIR, either as None if unreadable."""
+    values = []
+    for name in ("daemon.pid", "daemon.port"):
+        try:
+            with open(os.path.join(STATE_DIR, name)) as f:
+                values.append(int(f.read().strip()))
+        except (OSError, ValueError):
+            values.append(None)
+    return values[0], values[1]
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def port_healthy(port):
+    if not port:
+        return False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as resp:
+            return resp.status == 200 and json.loads(resp.read()).get("ok") is True
+    except Exception:
+        return False
+
+
+def live_daemon():
+    """Return (pid, port) of a daemon actually serving STATE_DIR, or None.
+
+    Deliberately the same two-signal test jobd.py's own live_daemon() uses, and for the same
+    reason: pid numbers get recycled, so a live pid alone would report an unrelated process as
+    the daemon, and a port that answers alone could be anything else bound to it. Both must
+    agree. Keeping the test identical also means this command's verdict matches the one the
+    daemon's start-up guard will reach.
+    """
+    pid, port = read_daemon_files()
+    if pid_alive(pid) and port_healthy(port):
+        return pid, port
+    return None
+
+
+def ps_field(pid, keyword):
+    """One `ps -o <keyword>=` field for a pid, or None if ps cannot answer.
+
+    `command` and `etime` are the only keywords used, and both behave identically on macOS and
+    Linux, which are the two platforms this tool runs on. Every failure - no ps, an unexpected
+    exit, empty output - becomes None so the caller can report "unknown": `daemon status` is a
+    diagnostic and must not be the thing that crashes.
+    """
+    try:
+        proc = subprocess.run(["ps", "-o", f"{keyword}=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def daemon_source(pid):
+    """The jobd.py path a running daemon was started from, read out of its argv via ps.
+
+    Read from the process table rather than asked over the API on purpose: this has to work
+    against a daemon of any vintage, including one started long before this command existed -
+    which is exactly the daemon whose source path you need to see.
+    """
+    line = ps_field(pid, "command")
+    if not line:
+        return None
+    for arg in line.split():
+        if arg.endswith("jobd.py"):
+            return arg
+    return None
+
+
+def daemon_uptime_secs(pid):
+    """Seconds since a daemon started, from `ps -o etime=`.
+
+    etime prints `[[DD-]HH:]MM:SS` on macOS and Linux alike. Anything that does not parse
+    returns None so the caller omits the line rather than printing a guessed uptime.
+    """
+    text = ps_field(pid, "etime")
+    if not text:
+        return None
+    days, _, clock = text.rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3:
+        return None
+    try:
+        secs = 0
+        for part in parts:
+            secs = secs * 60 + int(part)
+        return secs + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def active_jobs():
+    """Jobs the daemon currently considers running or stopping; [] if it cannot be asked."""
+    try:
+        jobs = request("GET", "/api/jobs")
+    except (urllib.error.URLError, OSError):
+        return []
+    return [j for j in jobs if j["status"] in ACTIVE_STATUSES]
+
+
+def print_job_lines(jobs):
+    id_w = max(12, max(len(j["id"]) for j in jobs))
+    for j in jobs:
+        job_pid = j["job_pid"] if j["job_pid"] is not None else "(none recorded)"
+        print(f"  {j['id']:<{id_w}} {j['status']:<8} job pid {job_pid}")
+
+
+def daemon_status():
+    """Report on the daemon serving STATE_DIR, whether or not one is running.
+
+    Exits 0 either way: like `git status`, the command succeeded when it told you the state.
+    """
+    live = live_daemon()
+    recorded_pid, recorded_port = read_daemon_files()
+
+    def field(label, value):
+        print(f"{label + ':':<9}{value}")
+
+    if live is None:
+        field("daemon", "(not running)")
+        field("state", STATE_DIR)
+        if recorded_pid or recorded_port:
+            field("stale", f"daemon.pid {recorded_pid}, daemon.port {recorded_port} - "
+                           "no daemon is answering; the next jobctl command will start one")
+        return
+
+    pid, port = live
+    field("daemon", f"running (pid {pid})")
+    field("port", port)
+    field("state", STATE_DIR)
+    uptime = daemon_uptime_secs(pid)
+    if uptime is not None:
+        field("uptime", fmt_duration(uptime))
+    source = daemon_source(pid)
+    if source is None:
+        field("source", "unknown (could not read the daemon's command line from ps)")
+    elif os.path.exists(source):
+        field("source", source)
+    else:
+        # The headline diagnostic. A daemon keeps serving from code resident in memory long
+        # after that code is moved or deleted, and the only visible symptom is a dashboard
+        # that 404s - because jobd.py resolves STATIC_DIR against __file__ at import time.
+        field("source", f"{source}  ** MISSING **")
+        print("         this file no longer exists. The daemon is still serving its API from")
+        print("         code held in memory, but its STATIC_DIR was resolved against that path")
+        print("         at import, so the dashboard will 404 until you run `jobctl daemon restart`.")
+    jobs = active_jobs()
+    running = sum(1 for j in jobs if j["status"] == "running")
+    stopping = len(jobs) - running
+    field("jobs", f"{running} running" + (f", {stopping} stopping" if stopping else ""))
+
+
+def daemon_gone(pid, port, timeout):
+    """Wait until the pid has exited *and* the port has stopped answering.
+
+    Both conditions, because a new daemon's own start-up guard tests both: starting while
+    either still holds would make it refuse to run, and the restart would fail confusingly
+    instead of racing quietly.
+    """
+    deadline = time.time() + timeout
+    while True:
+        if not pid_alive(pid) and not port_healthy(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def stop_daemon(live):
+    """SIGTERM the daemon at `live`, escalate to SIGKILL, and wait for it to be fully gone.
+
+    The signal goes to the daemon's own pid - never os.killpg. This command stops the daemon;
+    it does not stop jobs. Each job's supervisor is started in its own session, so a
+    process-group signal would not reach one anyway, but the distinction is the whole point of
+    the command: jobs are meant to outlive the daemon, and restarting must never become an
+    accidental way to kill a training run.
+    """
+    pid, port = live
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"error: could not signal daemon pid {pid}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if daemon_gone(pid, port, DAEMON_STOP_GRACE_SECS):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return daemon_gone(pid, port, DAEMON_STOP_GRACE_SECS)
+
+
+def daemon_stop():
+    """Stop the daemon and nothing else. Stopping an already-stopped daemon is a success."""
+    live = live_daemon()
+    if live is None:
+        print(f"no daemon is running for {STATE_DIR}")
+        return
+    jobs = active_jobs()  # asked while the daemon can still answer
+    print(f"stopping daemon pid {live[0]} (port {live[1]})")
+    if not stop_daemon(live):
+        print(f"error: daemon pid {live[0]} did not exit, even after SIGKILL", file=sys.stderr)
+        sys.exit(1)
+    print("stopped")
+    if jobs:
+        print()
+        print(f"{len(jobs)} job{'' if len(jobs) == 1 else 's'} still running - the daemon "
+              "does not own running jobs, and no signal from this command reached any of them:")
+        print_job_lines(jobs)
+    else:
+        print("no jobs were running")
+
+
+def warn_before_restart(jobs):
+    """Say what the restart costs, then let it proceed. Never blocks and never prompts."""
+    if not jobs:
+        return
+    print(f"{len(jobs)} job{'' if len(jobs) == 1 else 's'} active. A restart does not stop "
+          "running jobs - each runs in its own session, so no signal from this command reaches "
+          "one:")
+    print_job_lines(jobs)
+    unsupervised = [j for j in jobs if j["job_pid"] is None]
+    if unsupervised:
+        print()
+        print(f"{len(unsupervised)} of those "
+              f"{'has' if len(unsupervised) == 1 else 'have'} no job pid recorded. If it was "
+              "submitted seconds ago that is momentary - the daemon folds in the supervisor's "
+              "record on its next reconciliation. If it is older, the job predates the per-job "
+              "supervisor: nothing is watching it exit, so it will record exit_code: null "
+              "whenever it finishes, restart or no restart.")
+    print()
+
+
+def daemon_restart():
+    """Stop the running daemon, start a fresh one, and confirm the new one is healthy."""
+    live = live_daemon()
+    warn_before_restart(active_jobs() if live else [])
+    if live is None:
+        print(f"no daemon was running for {STATE_DIR}")
+    else:
+        print(f"stopping daemon pid {live[0]} (port {live[1]})")
+        if not stop_daemon(live):
+            print(f"error: daemon pid {live[0]} did not exit; not starting a second one over it",
+                  file=sys.stderr)
+            sys.exit(1)
+    # Come back up on the port the daemon was actually serving. ensure_daemon() spawns jobd.py,
+    # which reads $JOBCTL_PORT and otherwise falls back to 8787 - so restarting a daemon that
+    # was started on a non-default port would silently move it, breaking any SSH tunnel or
+    # bookmark aimed at the old one. An explicit $JOBCTL_PORT still wins: that is the caller
+    # asking for a particular port rather than for continuity.
+    if live and "JOBCTL_PORT" not in os.environ:
+        os.environ["JOBCTL_PORT"] = str(live[1])
+    ensure_daemon()
+    new = live_daemon()
+    if new is None:
+        print("error: the new daemon did not come up healthy; check "
+              f"{os.path.join(STATE_DIR, 'daemon.log')}", file=sys.stderr)
+        sys.exit(1)
+    print(f"started daemon pid {new[0]} (port {new[1]})")
+
+
+DAEMON_SUBCOMMANDS = {
+    "status": daemon_status,
+    "restart": daemon_restart,
+    "stop": daemon_stop,
+}
+
+
+def cmd_daemon(args):
+    if not args or args[0] not in DAEMON_SUBCOMMANDS:
+        print("error: usage: jobctl daemon <status|restart|stop>", file=sys.stderr)
+        sys.exit(2)
+    if len(args) > 1:
+        print(f"error: unknown option {args[1]}", file=sys.stderr)
+        sys.exit(2)
+    DAEMON_SUBCOMMANDS[args[0]]()
+
+
 def parse_host(argv):
     """Split a leading `--host <alias>` off argv, returning (alias_or_None, rest).
 
@@ -434,6 +730,7 @@ COMMANDS = {
     "stop": cmd_stop,
     "wait": cmd_wait,
     "ui": cmd_ui,
+    "daemon": cmd_daemon,
 }
 
 
@@ -452,7 +749,12 @@ def main():
         else:
             run_remote(host, argv)
         return
-    ensure_daemon()
+    if argv[0] != "daemon":
+        # `daemon` owns the daemon's lifecycle, so it must not be preceded by
+        # ensure_daemon(): `jobctl daemon status` would start a daemon in order to report
+        # that none was running, and `jobctl daemon stop` would start one just to stop it.
+        # cmd_daemon starts and stops the daemon itself, explicitly.
+        ensure_daemon()
     COMMANDS[argv[0]](argv[1:])
 
 

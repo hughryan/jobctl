@@ -303,6 +303,9 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 | `jobctl stop <id>` | `SIGTERM` the job's process group, escalating to `SIGKILL` after 10 seconds. |
 | `jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]` | Block until terminal state or timeout. Defaults: 540s timeout, 2s poll; a longer `--timeout` is clamped to `JOBCTL_MAX_WAIT` (45 minutes). Exit 0 = done, exit 1 = timed out. |
 | `jobctl ui` | Print the dashboard URL. |
+| `jobctl daemon status` | Report on the daemon itself: pid, port, state directory, uptime, the `jobd.py` it is running from, and how many jobs are active. Exits 0 whether or not one is running. |
+| `jobctl daemon restart` | Stop the daemon and start a fresh one. Running jobs are not affected; it says which ones are alive before it does anything. |
+| `jobctl daemon stop` | Stop the daemon. Jobs keep running. Stopping an already-stopped daemon is a success. |
 | `jobctl --host <ssh-alias> <any of the above>` | Run that command on a remote machine over SSH. |
 
 Job statuses are `running`, `stopping`, `exited` (the process finished on its own — check
@@ -451,6 +454,66 @@ ssh -N -L 8788:127.0.0.1:8787 gpu-box   # then open http://127.0.0.1:8788
 
 The local end of the tunnel is 8788 rather than 8787 so it can coexist with your own machine's
 dashboard — you can watch both at once in two tabs.
+
+### Inspecting and restarting the daemon
+
+The daemon is meant to be invisible — it starts itself and then runs for weeks. That is usually the
+right amount of attention to pay it, but it means the one failure mode it does have is silent.
+
+A running daemon serves its API from code the interpreter loaded at start-up. If you move or delete
+the `jobd.py` it was started from, the daemon does not notice: the API keeps working, jobs keep
+running, and nothing anywhere reports a problem. But `jobd.py` resolves `static/` against its own
+`__file__` at import, so the dashboard starts returning 404 and stays that way until the daemon is
+restarted. Nothing in the tool used to be able to tell you that had happened.
+
+`jobctl daemon status` is the answer to "is this daemon actually fine?":
+
+```
+$ jobctl daemon status
+daemon:  running (pid 48370)
+port:    8787
+state:   /Users/you/.jobctl
+uptime:  28h33m
+source:  /Users/you/src/old-location/jobd.py  ** MISSING **
+         this file no longer exists. The daemon is still serving its API from
+         code held in memory, but its STATIC_DIR was resolved against that path
+         at import, so the dashboard will 404 until you run `jobctl daemon restart`.
+jobs:    2 running
+```
+
+The source path is read from the daemon's own command line via `ps`, not asked over the API, so it
+works against a daemon of any age — including one started long before this command existed, which is
+exactly the daemon you need it for. If no daemon is running, `daemon status` says so and still exits
+0; it never starts one just to report on it.
+
+`jobctl daemon restart` stops the daemon and starts a new one. **Jobs are not affected.** Each job
+runs under its own supervisor in its own session, so no signal from the restart reaches it, and the
+supervisor records the exit code whether or not a daemon happens to be alive when the job finishes.
+The command says what is running before it touches anything:
+
+```
+$ jobctl daemon restart
+2 jobs active. A restart does not stop running jobs - each runs in its own session, so no signal from this command reaches one:
+  smart-hunt-v2-8f1a9e57 running  job pid (none recorded)
+  nightly-build-3c02aa17 running  job pid 51188
+
+1 of those has no job pid recorded. If it was submitted seconds ago that is momentary - the daemon
+folds in the supervisor's record on its next reconciliation. If it is older, the job predates the
+per-job supervisor: nothing is watching it exit, so it will record exit_code: null whenever it
+finishes, restart or no restart.
+
+stopping daemon pid 48370 (port 8787)
+started daemon pid 62104 (port 8787)
+```
+
+That warning is informational — nothing blocks and nothing prompts. It exists because a job old
+enough to predate the per-job supervisor loses its exit code no matter what you do, and a restart is
+the moment you are most likely to blame for it.
+
+The restart waits for the old daemon to be fully gone — process exited *and* port no longer
+answering — before starting the new one, because a daemon refuses to start over a state directory
+another live daemon still owns. `jobctl daemon stop` is the same stop without the start, for when you
+want the jobs to carry on unattended.
 
 ### Optional: using it from an AI coding agent
 

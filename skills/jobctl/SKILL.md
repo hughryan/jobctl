@@ -22,6 +22,9 @@ jobctl logs <id> [--tail N] [--follow]                               # read, or 
 jobctl stop <id>                                                     # SIGTERM, escalates to SIGKILL after 10s
 jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]                # block until terminal state or timeout (default 540s/2s, clamped to JOBCTL_MAX_WAIT)
 jobctl ui                                                            # prints the dashboard URL (http://127.0.0.1:8787)
+jobctl daemon status                                                 # is the daemon healthy? pid, port, uptime, the jobd.py it is running from
+jobctl daemon restart                                                # stop + start the daemon; running jobs are NOT affected
+jobctl daemon stop                                                   # stop the daemon; running jobs are NOT affected
 jobctl --host <ssh-alias> <any of the above>                         # run that command on a remote machine over SSH
 ```
 
@@ -38,6 +41,8 @@ Prefer `--tail N` for a bounded look at a running job (`--tail 20`) over `--foll
 The daemon auto-starts on first use of any `jobctl` command - no setup required. It binds to `127.0.0.1` only. `--cwd` is passed straight to the daemon as structured data (not shell-interpreted), so it's the way to run a job in a specific directory without a `cd &&` shell construct - useful since some harness guards refuse "complex" multi-part commands and worktree-pinned sessions can't always `cd` into an arbitrary path.
 
 `submit` confirms the command actually started before it returns, so a bad executable or `--cwd` fails the `submit` call itself - non-zero exit, no job id, and the OS error on stderr (only if that confirmation takes over 10 seconds is an id returned unconfirmed). Each job runs under a per-job supervisor that records the exit code from outside the daemon's lifetime, so exit codes survive daemon restarts - a `null` exit_code no longer means "the daemon restarted", only that the supervisor itself was killed without recording.
+
+`jobctl daemon status` reports on the daemon itself and never starts one, so it is safe to run just to look. Its point is the `source:` line: a daemon whose `jobd.py` has been moved or deleted keeps serving the API from code in memory while the dashboard silently 404s, and that is otherwise invisible. `jobctl daemon restart` fixes it. Restarting does **not** stop running jobs - they run in their own sessions under their own supervisors, which record exit codes regardless of the daemon - so it is not something to avoid while work is in flight.
 
 Log output already normalizes bare `\r` to line breaks (Python's line-splitting treats `\r` as a boundary), so `tqdm`-style progress bars show as clean successive lines in `jobctl logs` and the dashboard - no manual `tr '\r' '\n'` needed.
 
