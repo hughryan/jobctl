@@ -526,7 +526,7 @@ The command says what is running before it touches anything:
 ```
 $ jobctl daemon restart
 2 jobs active. A restart does not stop running jobs - each runs in its own session, so no signal from this command reaches one:
-  smart-hunt-v2-8f1a9e57 running  job pid (none recorded)
+  log-rotate-v2-4d7b0c21 running  job pid (none recorded)
   nightly-build-3c02aa17 running  job pid 51188
 
 1 of those has no job pid recorded. If it was submitted seconds ago that is momentary - the daemon

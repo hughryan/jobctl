@@ -6,7 +6,7 @@
     "-c",
     "for i in $(seq 1 5); do echo \"tick $i\"; sleep 1; done; echo done"
   ],
-  "cwd": "/Users/doubly/dev",
+  "cwd": "/tmp",
   "status": "exited",
   "pid": 46193,
   "started_at": 1785608744.6661,

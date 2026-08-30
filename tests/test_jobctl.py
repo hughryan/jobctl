@@ -4,10 +4,11 @@
 Standard library only, in keeping with the repository's headline invariant: the tests must
 run wherever the tool itself runs, which is anywhere with a Python 3 and nothing installed.
 
-The classes map onto the three axes that have actually broken this tool:
+The classes map onto the axes that have actually broken this tool:
 
   TestInvariants          one test per bullet in AGENTS.md, "Invariants — do not break these"
   TestLegacyRecords       a meta.json older than the code reading it — the KeyError axis
+  TestVersionSkew         a new CLI rendering what an older daemon served — the same axis, upstream
   TestInvocationContext   how a command is invoked, not what its argv says — the `ssh -n` axis
 
 Every subprocess runs against an isolated daemon: a fresh $JOBCTL_STATE_DIR *and* a free
@@ -17,7 +18,10 @@ fail to start. Nothing here reads or writes ~/.jobctl.
 
 Run with `python3 tests/test_jobctl.py` or `python3 -m unittest discover tests`.
 """
+import contextlib
+import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -33,6 +37,11 @@ REPO_ROOT = os.path.dirname(TESTS_DIR)
 JOBCTL_PATH = os.path.join(REPO_ROOT, "jobctl")
 JOBD_PATH = os.path.join(REPO_ROOT, "jobd.py")
 FIXTURES_DIR = os.path.join(TESTS_DIR, "fixtures")
+# The golden records in there are captured artifacts: their *shape* — which keys exist, and
+# which do not — comes from real records written by daemons that predate the fields now being
+# read, and that is the whole reason they can falsify anything. Their *values* are sanitized,
+# because this is a public repository and nothing here may carry a developer's local paths or
+# job names. Sanitize a value freely; never "simplify" the key set.
 
 # Files ensure_daemon() creates on its way to starting a local daemon. Their absence is the
 # structural proof that a --host invocation never reached it.
@@ -118,6 +127,47 @@ def read_ssh_log(path):
         return []
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def import_isolated(name, path, state_dir):
+    """Import jobctl or jobd.py in-process, with their module-level state pointed at scratch.
+
+    Both resolve STATE_DIR and their port from the environment at import time, so it has to
+    be right before exec_module rather than before the first call. Importing either starts
+    nothing — both guard their entry point on __main__ — and the environment is put back
+    afterwards so no later subprocess inherits a value it did not ask for.
+
+    `jobctl` has no `.py` extension, so spec_from_file_location cannot infer a loader for it
+    from the suffix; naming the loader explicitly is what makes the CLI importable at all.
+    """
+    previous = {key: os.environ.get(key) for key in ("JOBCTL_STATE_DIR", "JOBCTL_PORT")}
+    os.environ["JOBCTL_STATE_DIR"] = state_dir
+    os.environ["JOBCTL_PORT"] = str(free_port())
+    try:
+        loader = importlib.machinery.SourceFileLoader(name, path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def reap_process(proc):
+    """Kill a helper process and wait for it, so nothing spawned by a test outlives it."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    finally:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def plant_fixture(state_dir, fixture_name):
@@ -399,19 +449,7 @@ class TestLegacyRecords(DaemonHarness, unittest.TestCase):
             cls.ids[cls.FUTURE] = plant_fixture(state_dir, cls.FUTURE)
 
         cls.start_daemon(prepare=prepare)
-        # jobd's STATE_DIR and PORT are module-level, so the environment has to be right
-        # before the import. It starts no server: that is guarded by __main__.
-        previous = os.environ.get("JOBCTL_STATE_DIR")
-        os.environ["JOBCTL_STATE_DIR"] = cls.state_dir
-        try:
-            spec = importlib.util.spec_from_file_location("jobd_under_test", JOBD_PATH)
-            cls.jobd = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(cls.jobd)
-        finally:
-            if previous is None:
-                os.environ.pop("JOBCTL_STATE_DIR", None)
-            else:
-                os.environ["JOBCTL_STATE_DIR"] = previous
+        cls.jobd = import_isolated("jobd_under_test", JOBD_PATH, cls.state_dir)
 
     @classmethod
     def tearDownClass(cls):
@@ -434,6 +472,42 @@ class TestLegacyRecords(DaemonHarness, unittest.TestCase):
                          ["daemon", "status"]):
                 with self.subTest(fixture=name, args=args):
                     self.assertClean(args)
+
+    def test_daemon_restart_survives_an_active_legacy_job(self):
+        """A *running* job whose record predates `job_pid` — the production crash's shape.
+
+        The terminal fixtures cannot reach this: warn_before_restart returns immediately on
+        an empty list, so with only exited records neither it nor print_job_lines ever runs,
+        and the restart test would prove the daemon's backfill rather than the CLI's survival.
+        A record only stays "running" through reconciliation if its recorded pid is genuinely
+        alive, so the pid has to be a real process — which is why this is not a fixture. It is
+        the shape of any job submitted before there were supervisors, in a state directory
+        old enough to still hold one.
+        """
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        self.addCleanup(reap_process, sleeper)
+
+        record = self.fixture(self.LEGACY)
+        record["id"] = "legacy-active-0badf00d"
+        record["status"] = "running"
+        record["pid"] = sleeper.pid
+        record["ended_at"] = None
+        self.assertNotIn("job_pid", record, "the legacy fixture stopped predating job_pid")
+        d = os.path.join(self.state_dir, "jobs", record["id"])
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            json.dump(record, f, indent=2)
+        open(os.path.join(d, "log"), "a").close()
+
+        out = self.assertClean(["daemon", "restart"])
+        # Assert the warning actually rendered, not merely that nothing crashed: without this
+        # the test passes just as happily when the record never reaches the path at all.
+        self.assertIn(record["id"], out)
+        self.assertIn("job pid", out)
+        self.assertIn("(none recorded)", out)
+        self.assertIn("no job pid recorded", out)
 
     def test_daemon_restart_survives_an_old_record(self):
         """The exact invocation that raised KeyError: 'job_pid' against a real ~/.jobctl."""
@@ -473,6 +547,75 @@ class TestLegacyRecords(DaemonHarness, unittest.TestCase):
     def test_apply_meta_defaults_keeps_unknown_fields(self):
         meta = self.jobd.apply_meta_defaults(self.fixture(self.FUTURE))
         self.assertEqual(meta["some_future_field"], "x")
+
+
+class TestVersionSkew(unittest.TestCase):
+    """A new CLI rendering records served by a daemon older than itself.
+
+    This is how the production KeyError actually arose, and it sits upstream of the on-disk
+    axis: the old daemon predated apply_meta_defaults, so it served records with `job_pid`
+    genuinely *absent* — not present-and-null. Every test that runs against a current daemon
+    gets the key backfilled before the CLI ever sees it, so the defensive `.get()` calls in
+    print_job_lines and warn_before_restart are never exercised end to end. `daemon restart`
+    exists precisely to retire a daemon that predates the CLI running it, so these two
+    functions must render whatever such a daemon returns.
+
+    Called in-process rather than by resurrecting an old jobd.py: the input under test is the
+    record's shape, and building it directly is both exact and honest about what is asserted.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scratch = tempfile.mkdtemp(prefix="jobctl-skew-")
+        cls.jobctl = import_isolated("jobctl_under_test", JOBCTL_PATH, cls.scratch)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.scratch, ignore_errors=True)
+
+    def raw_record(self, job_id):
+        """A real pre-supervisor record, as an old daemon served it: no `job_pid` key."""
+        with open(os.path.join(FIXTURES_DIR, "meta-legacy-pre-supervisor.json")) as f:
+            record = json.load(f)
+        record["id"] = job_id
+        record["status"] = "running"
+        record["ended_at"] = None
+        self.assertNotIn("job_pid", record, "the legacy fixture stopped predating job_pid")
+        return record
+
+    def current_record(self, job_id, job_pid):
+        record = self.raw_record(job_id)
+        record["env"] = {}
+        record["job_pid"] = job_pid
+        return record
+
+    def capture(self, func, *args):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            func(*args)
+        return buffer.getvalue()
+
+    def test_print_job_lines_renders_a_record_with_no_job_pid_key(self):
+        out = self.capture(self.jobctl.print_job_lines, [self.raw_record("old-1a2b3c4d")])
+        self.assertIn("old-1a2b3c4d", out)
+        self.assertIn("(none recorded)", out)
+
+    def test_warn_before_restart_handles_a_record_with_no_job_pid_key(self):
+        out = self.capture(self.jobctl.warn_before_restart, [self.raw_record("old-1a2b3c4d")])
+        self.assertIn("1 job active", out)
+        self.assertIn("(none recorded)", out)
+        self.assertIn("1 of those has no job pid recorded", out)
+
+    def test_warn_before_restart_partitions_old_and_current_records(self):
+        """It splits on exactly the key an old daemon omits, so mix both shapes in one list."""
+        jobs = [self.raw_record("old-1a2b3c4d"), self.current_record("new-5e6f7a8b", 4242)]
+        out = self.capture(self.jobctl.warn_before_restart, jobs)
+        self.assertIn("2 jobs active", out)
+        self.assertIn("old-1a2b3c4d", out)
+        self.assertIn("new-5e6f7a8b", out)
+        self.assertIn("(none recorded)", out)
+        self.assertIn("4242", out)
+        self.assertIn("1 of those has no job pid recorded", out)
 
 
 class TestInvocationContext(unittest.TestCase):

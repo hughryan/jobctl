@@ -11,6 +11,7 @@ jobctl                  # CLI — talks to the daemon over HTTP, or to a remote 
 jobd.py                 # daemon — owns jobs, tracks state, serves the JSON API + dashboard
 static/index.html       # single-page dashboard served by the daemon
 skills/jobctl/SKILL.md  # Claude Code skill — teaches an agent when and how to use the tool
+tests/test_jobctl.py    # test suite — one test per invariant, plus golden records in fixtures/
 README.md               # human-facing docs: the problem, the design, full usage
 AGENTS.md               # this file (CLAUDE.md symlinks here)
 ```
@@ -130,3 +131,11 @@ Before committing:
   repository content.
 - Commit identity. Never set `user.name`/`user.email` or `GIT_AUTHOR_*`/`GIT_COMMITTER_*`;
   use whatever git resolves. Never add `Co-Authored-By` trailers.
+- Local system detail, in anything checked in. This is a public repository, so no file here may
+  carry an absolute path containing a username, a hostname, an ssh alias, or a job record copied
+  out of somebody's own `~/.jobctl`. Test fixtures are where this goes wrong, because the honest
+  instinct is right: a realistic old `meta.json` has to come from a real one, or it proves
+  nothing. Capture the *shape* from real state — which keys exist, and which do not — then
+  replace the values with generic ones. Documentation examples need the same care: a pasted
+  terminal transcript is a real transcript, and the job names in it are somebody's real work.
+  The keys are what the tests turn on; the values are only ever illustration.
