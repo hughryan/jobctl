@@ -37,6 +37,8 @@ Prefer `--tail N` for a bounded look at a running job (`--tail 20`) over `--foll
 
 The daemon auto-starts on first use of any `jobctl` command - no setup required. It binds to `127.0.0.1` only. `--cwd` is passed straight to the daemon as structured data (not shell-interpreted), so it's the way to run a job in a specific directory without a `cd &&` shell construct - useful since some harness guards refuse "complex" multi-part commands and worktree-pinned sessions can't always `cd` into an arbitrary path.
 
+A returned job id does **not** prove the command started. The command is executed by a per-job supervisor process after `submit` returns, so a bad executable or `--cwd` fails *asynchronously*: the job goes straight to `exited` with `exit_code` 127 and the reason in `jobctl logs <id>`. After submitting a command you haven't run before, a quick `jobctl status <id>` catches this immediately instead of a long `wait` discovering it. The same supervisor records exit codes durably, so they survive daemon restarts - a `null` exit_code no longer means "the daemon restarted", only that the supervisor itself was killed without recording.
+
 Log output already normalizes bare `\r` to line breaks (Python's line-splitting treats `\r` as a boundary), so `tqdm`-style progress bars show as clean successive lines in `jobctl logs` and the dashboard - no manual `tr '\r' '\n'` needed.
 
 ## Running jobs on a remote host

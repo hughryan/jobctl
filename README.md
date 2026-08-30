@@ -114,18 +114,37 @@ come up, and proceeds. First use is indistinguishable from every subsequent use.
 on one machine, not a scheduler, not a queue, and explicitly not something to expose to a network.
 Remote execution is handled by SSH (see below), not by opening the port.
 
-**Jobs run in their own session.** Every job is launched with `start_new_session=True`, so it gets
-its own process group. Two consequences follow: signals aimed at the daemon do not reach the job, and
-stopping a job can `killpg` the whole tree — `SIGTERM` first, escalating to `SIGKILL` after a 10
-second grace period — so a job that spawns children does not leave orphans behind.
+**Every job runs under a supervisor.** The daemon does not spawn your command directly. It spawns
+a tiny supervisor process (`jobd.py --supervise <id>`, started in its own session so signals aimed
+at the daemon never reach it), and the supervisor spawns the command inside that same process
+group, waits on it, and records the exit code to disk the moment it exits. The supervisor lives
+exactly as long as the job — so the exit code is recorded by something guaranteed to still be
+there when the job ends, whatever has happened to the daemon in between. Restarting or upgrading
+the daemon while jobs are running is therefore lossless: the new daemon picks the recorded results
+up off disk. In job metadata, `pid` is the supervisor — the process-group leader that signals and
+liveness checks are aimed at — and `job_pid` is the command itself. Stopping a job `killpg`s that
+group: `SIGTERM` first (which the supervisor ignores and the job does not, so the real exit code —
+typically `-15` — still gets recorded), escalating to `SIGKILL` after a 10 second grace period, so
+a job that spawns children does not leave orphans behind.
+
+**A command that cannot start fails as a job, not as a submit error.** Because the supervisor — not
+the daemon — executes the command, a bad executable or a missing `--cwd` directory no longer fails
+the submit call. `jobctl submit -- definitely-not-a-command` still prints a job id; the job then
+immediately reaches `exited` with `exit_code` 127 (the shell's "command not found" convention) and
+the reason on the first line of its log. A job that finishes suspiciously fast deserves a
+`jobctl status` and `jobctl logs` look.
 
 **State lives on disk.** Each job gets a directory under `~/.jobctl/jobs/<id>/` containing
-`meta.json` (id, name, command, cwd, pid, status, timestamps, exit code) and `log` (combined stdout
-and stderr, unbuffered). The daemon is not the source of truth — the filesystem is. Restart the
-daemon, reboot into it, attach from a fresh shell: the history is still there. A background watcher
-thread reconciles every job every two seconds, comparing recorded state against actual process
-liveness, so a job that ended while the daemon was down is still marked `exited` rather than sitting
-in a permanent, wrong `running` state.
+`meta.json` (id, name, command, cwd, pid, status, timestamps, exit code), `supervisor.json` (the
+supervisor's record: the command's real pid, then its exit code once it ends), and `log` (combined
+stdout and stderr, unbuffered). Each file has exactly one writer — the daemon owns `meta.json`, the
+supervisor owns `supervisor.json` and the log — so no two processes ever race over the same file.
+The daemon is not the source of truth — the filesystem is. Restart the daemon, reboot into it,
+attach from a fresh shell: the history is still there. A background watcher thread reconciles every
+job every two seconds, folding the supervisor's record into `meta.json` and comparing recorded
+state against actual process liveness, so a job that ended while the daemon was down is still
+marked `exited` — with its real exit code — rather than sitting in a permanent, wrong `running`
+state.
 
 **`wait` blocks server-side.** `jobctl wait <id>` sits in a single foreground process until the job
 reaches a terminal state or the timeout elapses. Exit `0` means finished (the full job JSON is
@@ -451,10 +470,12 @@ any agent involved; the skill is just how you hand that usefulness to one.
 - **Jobs do not survive a reboot.** The daemon is not a supervisor and will not restart jobs. On-disk
   state survives — you will see the historical record — but a running job ends when the machine goes
   down.
-- **Exit codes can be unknown after a daemon restart.** If the daemon is restarted while a job is
-  running, it loses the `Popen` handle and falls back to PID liveness checks. The job keeps running
-  and is correctly marked `exited` when it finishes, but `exit_code` will be `null`, because nothing
-  was attached to reap it. If you need a definitive result, have the job itself write one.
+- **Exit codes survive daemon restarts.** Each job's supervisor records the exit code from outside
+  the daemon's lifetime, so restarting — or crashing — the daemon while jobs run loses nothing: the
+  job keeps running, and the restarted daemon reads the recorded code off disk. The one way
+  `exit_code` can still be `null` is a supervisor that died without recording — its own crash, or a
+  `SIGKILL` from something other than `jobctl stop` (stop's own escalation is recorded as `-9`,
+  since the daemon that sent it knows exactly how the job died).
 - **Jobs are unbounded.** There is no queue, no concurrency limit, and no scheduling. Submit ten jobs
   and ten jobs start. That is intentional — it is a job *runner*, not a job *scheduler*.
 - **Old jobs accumulate.** Nothing prunes `~/.jobctl/jobs/`. Delete directories under it whenever the

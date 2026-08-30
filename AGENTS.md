@@ -39,6 +39,13 @@ well-intentioned refactor breaks.
   between `jobctl` and the job, so there is no quoting or word-splitting layer to get wrong.
   Joining it into a string would introduce an injection and quoting surface that does not
   currently exist.
+- **One writer per file: the daemon owns `meta.json`; the supervisor owns `supervisor.json` and
+  the log.** The daemon folds the supervisor's record into `meta.json` during reconciliation; the
+  supervisor never touches `meta.json`, and the daemon never writes `supervisor.json`. Writes are
+  atomic (tmp + `os.replace`), so single-writer means no cross-process locking is needed at all.
+  "Why not have the supervisor update `meta.json` directly?" looks like a simplification and
+  reintroduces a read-modify-write race — e.g. `stop_job`'s `status: "stopping"` landing after the
+  supervisor's `exited` and stranding the job as "stopping" forever.
 - **The daemon binds `127.0.0.1` only.** It has no authentication and assumes a single local
   user. Multi-machine use goes through SSH via `--host`, which keeps authentication in SSH
   where it belongs. Never bind another interface or add a network-exposed mode.
