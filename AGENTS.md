@@ -66,6 +66,13 @@ well-intentioned refactor breaks.
 - **The daemon binds `127.0.0.1` only.** It has no authentication and assumes a single local
   user. Multi-machine use goes through SSH via `--host`, which keeps authentication in SSH
   where it belongs. Never bind another interface or add a network-exposed mode.
+- **`--host` runs `ssh -n`; never remove the `-n`.** `ssh` reads stdin by default, so without
+  it the first `--host` call inside a script fed from stdin consumes the rest of that script as
+  input for the remote command, and every later line silently never runs. That breaks this
+  tool's own documented polling idiom — `while ! jobctl --host h wait ...; do :; done` piped
+  into a shell, which both `README.md` and the agent skill instruct people to use — and it
+  fails without an error, so the loop simply appears to have worked. No subcommand ever needs
+  local stdin: the job's own stdin is `DEVNULL`, set by the supervisor.
 - **Exit codes are a contract.** `jobctl wait` exits `0` on terminal state and `1` on timeout;
   the documented `while ! jobctl wait ...; do :; done` loop depends on it, and `--host`
   propagates the remote code verbatim. Do not remap or swallow exit codes.

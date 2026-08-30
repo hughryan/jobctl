@@ -718,7 +718,13 @@ def ssh_argv(host, args):
     remote = " ".join(shlex.quote(a) for a in ["jobctl"] + args)
     max_wait = os.environ.get("JOBCTL_MAX_WAIT", "")
     prefix = f"JOBCTL_MAX_WAIT={shlex.quote(max_wait)} " if max_wait else ""
-    return ["ssh", host, f'PATH="$HOME/.local/bin:$PATH" {prefix}{remote}']
+    # -n is load-bearing, not tidiness. ssh reads stdin by default, so without it the first
+    # --host call inside a script fed from stdin consumes the remainder of that script as
+    # input meant for the remote command, and everything after it silently never runs. That
+    # breaks this tool's own documented polling idiom -- `while ! jobctl --host h wait ...;
+    # do :; done` piped into a shell -- and no jobctl subcommand ever sends stdin anywhere:
+    # the job's own stdin is DEVNULL, set by the supervisor.
+    return ["ssh", "-n", host, f'PATH="$HOME/.local/bin:$PATH" {prefix}{remote}']
 
 
 def run_remote(host, args):
