@@ -148,9 +148,10 @@ loudly instead of quietly running your GPU job on your laptop. Silent wrong-mach
 precisely what the flag exists to prevent.
 
 **A dashboard for humans.** `jobctl ui` prints `http://127.0.0.1:8787`. Open it for a live table of
-every job with status, runtime, command, working directory, a click-to-expand log viewer, and a Stop
-button. It refreshes every two seconds. Useful when several runs are in flight and you want to see
-all of them at a glance, or kill one by hand.
+recent jobs with status, runtime, command, working directory, a click-to-expand log viewer, and a
+Stop button. It refreshes every two seconds. Like `jobctl list`, it shows the last 24 hours plus
+everything still active, with a **Show all** toggle for the full history. Useful when several runs
+are in flight and you want to see all of them at a glance, or kill one by hand.
 
 **Progress bars render correctly.** Tools like `tqdm` redraw a single line using bare carriage
 returns, which turns a naive log capture into one enormous unreadable line. `jobctl` splits on `\r`

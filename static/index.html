@@ -21,12 +21,14 @@
   .cmd { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.8rem; opacity: 0.85; }
   button { font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 0.4rem; border: 1px solid rgba(128,128,128,0.4); background: transparent; color: inherit; cursor: pointer; }
   button:hover { background: rgba(128,128,128,0.15); }
+  #controls { margin-bottom: 0.75rem; }
   pre.log { background: rgba(128,128,128,0.08); padding: 0.75rem; border-radius: 0.4rem; max-height: 320px; overflow: auto; font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; }
   .empty { opacity: 0.6; font-style: italic; padding: 1rem 0; }
 </style>
 </head>
 <body>
 <h1>jobctl — running &amp; recent jobs</h1>
+<div id="controls"><button id="show-all" style="display:none"></button></div>
 <table id="jobs">
   <thead><tr><th>ID</th><th>Status</th><th>Runtime</th><th>Command</th><th>CWD</th><th></th></tr></thead>
   <tbody id="jobs-body"></tbody>
@@ -34,7 +36,32 @@
 <div id="empty" class="empty" style="display:none">No jobs yet.</div>
 
 <script>
+const RECENT_WINDOW_SECS = 24 * 60 * 60;
+const CMD_MAX_CHARS = 100;
+const ACTIVE_STATUSES = ['running', 'stopping'];
+
 const expanded = new Set();
+let showAll = false;
+
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+}
+
+function isActive(j) {
+  return ACTIVE_STATUSES.includes(j.status);
+}
+
+/** Active jobs always show, however old; everything else only within the recency window. */
+function isRecent(j) {
+  return isActive(j) || j.started_at >= (Date.now() / 1000) - RECENT_WINDOW_SECS;
+}
+
+function fmtCmd(cmd) {
+  const oneLine = cmd.join(' ').trim().split(/\s+/).join(' ');
+  return oneLine.length > CMD_MAX_CHARS ? oneLine.slice(0, CMD_MAX_CHARS) + '…' : oneLine;
+}
 
 function fmtDuration(secs) {
   secs = Math.floor(secs);
@@ -64,12 +91,28 @@ function toggle(id) {
   render();
 }
 
+function toggleShowAll() {
+  showAll = !showAll;
+  render();
+}
+
 async function render() {
-  const jobs = await fetchJobs();
+  const all = await fetchJobs();
+  const recent = all.filter(isRecent);
+  const jobs = showAll ? all : recent;
+  const hidden = all.length - recent.length;
   const body = document.getElementById('jobs-body');
   const empty = document.getElementById('empty');
+  const showAllBtn = document.getElementById('show-all');
   body.innerHTML = '';
+
+  showAllBtn.style.display = (showAll || hidden > 0) ? 'inline-block' : 'none';
+  showAllBtn.textContent = showAll ? 'Show recent' : `Show all (${all.length})`;
+
   empty.style.display = jobs.length ? 'none' : 'block';
+  empty.textContent = all.length
+    ? `No jobs started in the last 24 hours — use “Show all (${all.length})” to see older jobs.`
+    : 'No jobs yet.';
 
   for (const j of jobs) {
     const end = j.ended_at || (Date.now() / 1000);
@@ -77,13 +120,12 @@ async function render() {
     tr.className = 'job-row';
     tr.onclick = () => toggle(j.id);
     tr.innerHTML = `
-      <td>${j.id}</td>
-      <td><span class="status ${j.status}">${j.status}</span></td>
+      <td>${escapeHtml(j.id)}</td>
+      <td><span class="status ${escapeHtml(j.status)}">${escapeHtml(j.status)}</span></td>
       <td>${fmtDuration(end - j.started_at)}</td>
-      <td class="cmd">${j.cmd.join(' ').slice(0, 100)}</td>
-      <td class="cmd">${j.cwd || ''}</td>
-      <td>${(j.status === 'running' || j.status === 'stopping')
-          ? `<button data-stop="${j.id}">Stop</button>` : ''}</td>
+      <td class="cmd">${escapeHtml(fmtCmd(j.cmd))}</td>
+      <td class="cmd">${escapeHtml(j.cwd || '')}</td>
+      <td>${isActive(j) ? `<button data-stop="${escapeHtml(j.id)}">Stop</button>` : ''}</td>
     `;
     body.appendChild(tr);
 
@@ -104,6 +146,7 @@ async function render() {
   }
 }
 
+document.getElementById('show-all').onclick = toggleShowAll;
 render();
 setInterval(render, 2000);
 </script>
