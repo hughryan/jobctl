@@ -296,7 +296,7 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 
 | Command | What it does |
 | --- | --- |
-| `jobctl submit [--name NAME] [--cwd DIR] -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. |
+| `jobctl submit [--name NAME] [--cwd DIR] [--env KEY=VALUE]... -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. `--env` is repeatable and sets one variable in the job's environment on top of the daemon's own (last wins on a repeated key). |
 | `jobctl list [--all] [--since DURATION]` | Table of jobs — id, status, runtime, command. Shows the last 24 hours plus every still-active job; `--since 7d` widens the window (`s`/`m`/`h`/`d`, bare number = seconds), `--all` drops it. |
 | `jobctl status <id>` | Full JSON for one job: status, pid, exit code, timestamps, cwd, command. |
 | `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` prints those last lines, then streams new output until the job ends (exit 0) or `JOBCTL_MAX_WAIT` elapses (exit 1 — resume with `--follow --tail 0`). |
@@ -385,8 +385,40 @@ structured data, not shell-interpreted:
 $ jobctl submit --name test --cwd /path/to/project -- pytest -x tests/
 ```
 
+Set variables in the job's environment with `--env KEY=VALUE`, repeated once per variable. The job
+inherits the daemon's environment and these are applied on top of it. The value is split on the
+first `=` only, so a value may itself contain `=`, and a repeated key takes its last value:
+
+```bash
+$ jobctl submit --name train --env CUDA_VISIBLE_DEVICES=1 --env WANDB_MODE=offline -- python train.py
+```
+
 Nothing about any of this is tied to a particular language or tool. `jobctl submit -- <anything>`
 works for any command you would otherwise run in a terminal.
+
+### Log buffering, and why logs used to look empty
+
+A job's stdout is a file, not a terminal. Programs check that: seeing a pipe or a file rather than a
+tty, most switch from line buffering to 4KB block buffering, and their output sits in their own
+memory until a block fills or they exit. The visible symptom was a healthy twelve-hour training run
+whose `jobctl logs` showed 49 bytes after ninety minutes — nothing wrong with the job, and no way to
+watch it.
+
+`jobctl` now sets `PYTHONUNBUFFERED=1` for every job, so Python programs write straight through and
+`jobctl logs` and `--follow` are usable on a running job from the first line. Opt out by setting the
+variable to empty — Python honours only a non-empty value, so this restores the default buffering:
+
+```bash
+$ jobctl submit --env PYTHONUNBUFFERED= -- python train.py
+```
+
+That fixes Python and only Python. The buffer lives inside the job's own C library, so nothing
+outside the process can flush it: a block-buffering program in any other language needs its own
+answer, either a flag of its own or an external nudge.
+
+```bash
+$ jobctl submit -- stdbuf -oL -eL ./my-program     # force line buffering on a program that has no flag
+```
 
 ### Running jobs on a remote host
 

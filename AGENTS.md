@@ -54,6 +54,15 @@ well-intentioned refactor breaks.
   every existing record raise `KeyError` in the next thing that reads it. The CLI reads job
   records defensively for the mirror-image reason: `daemon restart` exists to replace a daemon
   older than the CLI invoking it, so it must not require that daemon to speak the current schema.
+- **The supervisor composes a job's environment in one order: inherited environment, then
+  jobctl's own defaults, then `meta["env"]` last.** `--env` is the caller's final word, so the
+  values it supplies must be applied on top of everything jobctl sets for itself — today that
+  is `PYTHONUNBUFFERED=1`, added so a file-backed stdout does not block-buffer a running job's
+  logs into invisibility. Reversing the last two steps still looks correct and still passes a
+  casual test, but silently strips `--env` of the ability to override a default. The concrete
+  casualty is the opt-out: `--env PYTHONUNBUFFERED=` works only because an empty value lands
+  after the default and Python honours only a non-empty one. Applied first, it is overwritten,
+  and the flag does nothing with no error to say so.
 - **The daemon binds `127.0.0.1` only.** It has no authentication and assumes a single local
   user. Multi-machine use goes through SSH via `--host`, which keeps authentication in SSH
   where it belongs. Never bind another interface or add a network-exposed mode.
