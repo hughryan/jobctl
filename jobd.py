@@ -68,10 +68,33 @@ def write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
+def apply_meta_defaults(meta):
+    """Fill in every field a job record carries, leaving values already present untouched.
+
+    This is the single definition of the record's shape: `submit_job` builds a new record
+    through it and `read_meta` backfills existing ones. meta.json outlives the code that
+    wrote it -- a job submitted weeks ago, by a daemon predating a field, is still listed
+    and still reconciled today -- so a field added here reaches those older records instead
+    of raising KeyError in whatever reads them next. Defaults are built per call, so no
+    caller can mutate a shared one, and setdefault leaves the caller's key order intact.
+    """
+    defaults = {
+        "status": "running",
+        "pid": None,
+        "job_pid": None,
+        "env": {},
+        "ended_at": None,
+        "exit_code": None,
+    }
+    for key, value in defaults.items():
+        meta.setdefault(key, value)
+    return meta
+
+
 def read_meta(job_id):
     path = os.path.join(job_dir(job_id), "meta.json")
     with open(path) as f:
-        return json.load(f)
+        return apply_meta_defaults(json.load(f))
 
 
 def write_meta(job_id, meta):
@@ -184,19 +207,14 @@ def submit_job(name, cmd, cwd, env_overrides):
     d = job_dir(job_id)
     os.makedirs(d, exist_ok=True)
 
-    meta = {
+    meta = apply_meta_defaults({
         "id": job_id,
         "name": name,
         "cmd": cmd,
         "cwd": cwd,
         "env": env_overrides or {},  # applied by the supervisor on top of its inherited env
-        "status": "running",
-        "pid": None,
-        "job_pid": None,
         "started_at": time.time(),
-        "ended_at": None,
-        "exit_code": None,
-    }
+    })
     write_meta(job_id, meta)
     # Touch the log so reads never 404 in the moment before the supervisor opens it. The
     # supervisor writes it; the daemon keeps no handle on it.
