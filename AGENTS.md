@@ -46,6 +46,14 @@ well-intentioned refactor breaks.
   "Why not have the supervisor update `meta.json` directly?" looks like a simplification and
   reintroduces a read-modify-write race — e.g. `stop_job`'s `status: "stopping"` landing after the
   supervisor's `exited` and stranding the job as "stopping" forever.
+- **`meta.json` outlives the code that wrote it; add fields only through `apply_meta_defaults()`.**
+  A job submitted weeks ago is still listed and still reconciled by whatever daemon is running
+  today, so a record on disk can be older than every field the current code expects. `read_meta`
+  routes every record through `apply_meta_defaults()`, the single definition of the record's
+  shape — `submit_job` builds new records through it too. Adding a field anywhere else makes
+  every existing record raise `KeyError` in the next thing that reads it. The CLI reads job
+  records defensively for the mirror-image reason: `daemon restart` exists to replace a daemon
+  older than the CLI invoking it, so it must not require that daemon to speak the current schema.
 - **The daemon binds `127.0.0.1` only.** It has no authentication and assumes a single local
   user. Multi-machine use goes through SSH via `--host`, which keeps authentication in SSH
   where it belongs. Never bind another interface or add a network-exposed mode.

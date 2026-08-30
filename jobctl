@@ -473,10 +473,18 @@ def active_jobs():
 
 
 def print_job_lines(jobs):
+    """Render active jobs for the restart warning.
+
+    `job_pid` is read defensively because this is the one place the CLI is routinely newer
+    than the daemon answering it: `daemon restart` exists precisely to replace a daemon that
+    predates the running CLI, so the command whose whole purpose is to retire an old daemon
+    must not require that daemon to speak the current schema.
+    """
     id_w = max(12, max(len(j["id"]) for j in jobs))
     for j in jobs:
-        job_pid = j["job_pid"] if j["job_pid"] is not None else "(none recorded)"
-        print(f"  {j['id']:<{id_w}} {j['status']:<8} job pid {job_pid}")
+        job_pid = j.get("job_pid")
+        shown = "(none recorded)" if job_pid is None else job_pid
+        print(f"  {j['id']:<{id_w}} {j['status']:<8} job pid {shown}")
 
 
 def daemon_status():
@@ -593,7 +601,7 @@ def warn_before_restart(jobs):
           "running jobs - each runs in its own session, so no signal from this command reaches "
           "one:")
     print_job_lines(jobs)
-    unsupervised = [j for j in jobs if j["job_pid"] is None]
+    unsupervised = [j for j in jobs if j.get("job_pid") is None]
     if unsupervised:
         print()
         print(f"{len(unsupervised)} of those "
