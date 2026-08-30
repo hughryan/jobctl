@@ -585,6 +585,19 @@ any agent involved; the skill is just how you hand that usefulness to one.
 - **Old jobs accumulate.** Nothing prunes `~/.jobctl/jobs/`. Delete directories under it whenever the
   history gets long; the daemon will not miss them.
 
+## Development
+
+```bash
+python3 tests/test_jobctl.py          # or: python3 -m unittest discover tests
+```
+
+The suite is a single file using the standard library's `unittest` — no dependencies, same as the
+tool. Each test runs against a throwaway daemon isolated by two environment variables, both of which
+are required: `JOBCTL_STATE_DIR` points the files (`daemon.pid`, `daemon.port`, `jobs/`) at a
+scratch directory, and `JOBCTL_PORT` gives that daemon a free port to bind instead of the default
+`8787`. Nothing in the suite reads or writes your real `~/.jobctl`, and no test daemon or job
+outlives the run.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
