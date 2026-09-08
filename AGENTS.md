@@ -97,6 +97,24 @@ well-intentioned refactor breaks.
   `reconcile_job` when a job dies while paused. Without that last one a job killed while frozen
   would count the frozen time as work forever. Runtime is meant to answer "how long has this job
   been working", so a run parked overnight to free the GPU must not report the parking.
+- **A `queued` job is active, has no pid and no `started_at`; the watcher starts it on the
+  dependency's terminal state.** `--after` makes deferred work a record rather than a process, so
+  the job it waits on is the only thing that can start it: `submit_job` writes the record and
+  returns, and `start_queued_jobs` in the watcher spawns it — through the same `start_job` a
+  synchronous submit uses — on the first tick where the dependency is no longer active. `queued`
+  therefore belongs in `ACTIVE_STATUSES` in all three places (`jobd.py`, `jobctl`,
+  `static/index.html`): a job that has not started must never read as finished to `wait` or
+  `list`. The consequence to preserve everywhere else is that **`started_at` can be `None`** —
+  it is the field that distinguishes a job that has begun from one still waiting, so it is set
+  at the moment of the spawn and not before, and every reader of it (the `/api/jobs` sort key,
+  `list`'s window filter and runtime column, the dashboard's) must tolerate `None` rather than
+  arithmetic on it. Two more properties follow from having no process: `reconcile_job` returns a
+  queued record untouched (there is no liveness to check and no supervisor record to fold in),
+  and `stop_job` marks it `stopped` without signalling anything — which is also what stops the
+  watcher from ever starting it. The dependency's exit code is deliberately irrelevant: a job
+  queued behind a run that fails still gets its turn, because `--after` chains work and does not
+  express success. `test_after_starts_when_the_dependency_ends` pins the chain and the `-`
+  runtime, `test_stop_on_a_queued_job_never_starts_it` the stop.
 - **Exit codes are a contract.** `jobctl wait` exits `0` on terminal state and `1` on timeout;
   the documented `while ! jobctl wait ...; do :; done` loop depends on it, and `--host`
   propagates the remote code verbatim. Do not remap or swallow exit codes.

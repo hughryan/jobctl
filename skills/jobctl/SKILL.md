@@ -15,7 +15,7 @@ Use it whenever a task:
 ## Commands
 
 ```bash
-jobctl submit [--name NAME] [--cwd DIR] [--env K=V]... -- <any command and args>   # returns a job id immediately
+jobctl submit [--name NAME] [--cwd DIR] [--env K=V]... [--after ID] -- <any command and args>   # returns a job id immediately
 jobctl list [--all] [--since DURATION]                               # table of jobs + status: last 24h plus every active job
 jobctl status <id>                                                   # full JSON: status, pid, exit_code, timestamps
 jobctl logs <id> [--tail N] [--follow]                               # read, or tail, combined stdout+stderr; --follow is bounded (see below)
@@ -45,6 +45,8 @@ The daemon auto-starts on first use of any `jobctl` command - no setup required.
 `submit` confirms the command actually started before it returns, so a bad executable or `--cwd` fails the `submit` call itself - non-zero exit, no job id, and the OS error on stderr (only if that confirmation takes over 10 seconds is an id returned unconfirmed). Each job runs under a per-job supervisor that records the exit code from outside the daemon's lifetime, so exit codes survive daemon restarts - a `null` exit_code no longer means "the daemon restarted", only that the supervisor itself was killed without recording.
 
 `jobctl pause <id>` freezes a job's whole process group with `SIGSTOP` and `jobctl resume <id>` thaws it with `SIGCONT`. The job stops computing instantly but keeps everything it holds - its process, its memory, and any GPU memory it has allocated - so pausing hands over the CPU, not the VRAM; it is the way to yield a machine briefly without losing hours of a training run. A paused job is still active: it shows in `list`, `wait` keeps blocking on it, and `logs --follow` keeps following. The time spent paused is excluded from the runtime column. `stop` works normally on a paused job (it continues it first, then terminates it), and pausing a job that is not running - or resuming one that is not paused - fails with exit 1 and a message naming the job's actual state.
+
+`--after ID` queues a job behind another one instead of starting it now: it sits at status `queued` — no process, no start time, runtime `-` in `list` — and the daemon starts it the moment job `ID` reaches a terminal state, whatever that state is (`--after` chains work, not success: the dependency's exit code is irrelevant, and a job stopped by `jobctl stop` releases the queue just as a clean exit does). Use it instead of a polling shell wrapper like `while pgrep ...; do sleep 120; done; <cmd>`, which occupies a job slot reading as `running` for hours while it sleeps. `wait` blocks on a queued job exactly as on a running one, so a single `jobctl wait <queued-id>` blocks through both jobs. `jobctl stop` on a queued job marks it `stopped` and it never runs; submitting `--after` an id that does not exist fails the submit itself (exit 1, no job created).
 
 `jobctl daemon status` reports on the daemon itself and never starts one, so it is safe to run just to look. Its point is the `source:` line: a daemon whose `jobd.py` has been moved or deleted keeps serving the API from code in memory while the dashboard silently 404s, and that is otherwise invisible. `jobctl daemon restart` fixes it. Restarting does **not** stop running jobs - they run in their own sessions under their own supervisors, which record exit codes regardless of the daemon - so it is not something to avoid while work is in flight.
 

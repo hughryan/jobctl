@@ -195,7 +195,7 @@ The CLI is a thin client over this; use it directly if you want to build somethi
 | --- | --- | --- |
 | `GET` | `/api/health` | Liveness probe — `{"ok": true}`. |
 | `GET` | `/api/jobs` | All jobs, newest first, reconciled. |
-| `POST` | `/api/jobs` | Submit. Body: `{"name", "cmd": [...], "cwd", "env": {...}}`. Returns `{"id"}`. |
+| `POST` | `/api/jobs` | Submit. Body: `{"name", "cmd": [...], "cwd", "env": {...}, "after"}`. `after` is the id of a job to start behind (400 if no such job). Returns `{"id"}`. |
 | `GET` | `/api/jobs/<id>` | One job's full metadata. |
 | `GET` | `/api/jobs/<id>/log?tail=N` | Last `N` lines of combined output (default 200). |
 | `POST` | `/api/jobs/<id>/stop` | `SIGTERM` the process group, `SIGKILL` after 10s. |
@@ -298,7 +298,7 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 
 | Command | What it does |
 | --- | --- |
-| `jobctl submit [--name NAME] [--cwd DIR] [--env KEY=VALUE]... -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. `--env` is repeatable and sets one variable in the job's environment on top of the daemon's own (last wins on a repeated key). |
+| `jobctl submit [--name NAME] [--cwd DIR] [--env KEY=VALUE]... [--after ID] -- <cmd> [args...]` | Launch a detached job; prints its id immediately and returns. `--env` is repeatable and sets one variable in the job's environment on top of the daemon's own (last wins on a repeated key). `--after ID` queues the job instead of starting it: the daemon starts it when job `ID` reaches a terminal state, whatever that state is. |
 | `jobctl list [--all] [--since DURATION]` | Table of jobs — id, status, runtime, command. Shows the last 24 hours plus every still-active job; `--since 7d` widens the window (`s`/`m`/`h`/`d`, bare number = seconds), `--all` drops it. |
 | `jobctl status <id>` | Full JSON for one job: status, pid, exit code, timestamps, cwd, command. |
 | `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` prints those last lines, then streams new output until the job ends (exit 0) or `JOBCTL_MAX_WAIT` elapses (exit 1 — resume with `--follow --tail 0`). |
@@ -312,12 +312,15 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 | `jobctl daemon stop` | Stop the daemon. Jobs keep running. Stopping an already-stopped daemon is a success. |
 | `jobctl --host <ssh-alias> <any of the above>` | Run that command on a remote machine over SSH. |
 
-Job statuses are `running`, `paused` (frozen by `jobctl pause`, holding its memory but using no
-CPU or GPU), `stopping`, `exited` (the process finished on its own — check `exit_code`), and
-`stopped` (it was terminated by `jobctl stop`). A paused job counts as active everywhere a running
-one does — `list` keeps showing it, `wait` keeps blocking on it — and the time it spends paused is
-subtracted from the runtime column, so parking a job overnight does not read as eight hours of work
-in the morning.
+Job statuses are `running`, `queued` (submitted with `--after`, waiting for another job to finish),
+`paused` (frozen by `jobctl pause`, holding its memory but using no CPU or GPU), `stopping`,
+`exited` (the process finished on its own — check `exit_code`), and `stopped` (it was terminated by
+`jobctl stop`). A paused job counts as active everywhere a running one does — `list` keeps showing
+it, `wait` keeps blocking on it — and the time it spends paused is subtracted from the runtime
+column, so parking a job overnight does not read as eight hours of work in the morning. A queued job
+counts as active too, for the opposite reason: it has not started, so nothing may read it as
+finished. It has no process and no start time, so `list` shows its runtime as `-`, and stopping it
+simply means it never runs.
 
 The `--` before the command is required. Everything after it is the command and its arguments, taken
 verbatim; everything before it belongs to `jobctl`. This is what lets a job take flags of its own
