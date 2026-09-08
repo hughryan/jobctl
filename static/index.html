@@ -19,6 +19,7 @@
   .status.stopped { background: #c6280022; color: #c62800; }
   .status.stopping { background: #b8860022; color: #b86000; }
   .status.paused { background: #1565c022; color: #1565c0; }
+  .status.queued { background: #5c6bc022; color: #5c6bc0; }
   .cmd { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.8rem; opacity: 0.85; }
   button { font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 0.4rem; border: 1px solid rgba(128,128,128,0.4); background: transparent; color: inherit; cursor: pointer; }
   button:hover { background: rgba(128,128,128,0.15); }
@@ -39,7 +40,7 @@
 <script>
 const RECENT_WINDOW_SECS = 24 * 60 * 60;
 const CMD_MAX_CHARS = 100;
-const ACTIVE_STATUSES = ['running', 'stopping', 'paused'];
+const ACTIVE_STATUSES = ['running', 'stopping', 'paused', 'queued'];
 
 const expanded = new Set();
 let showAll = false;
@@ -56,7 +57,9 @@ function isActive(j) {
 
 /** Active jobs always show, however old; everything else only within the recency window. */
 function isRecent(j) {
-  return isActive(j) || j.started_at >= (Date.now() / 1000) - RECENT_WINDOW_SECS;
+  // A job stopped while still queued never started, so it is placed by when it was queued.
+  const start = j.started_at || j.queued_at || 0;
+  return isActive(j) || start >= (Date.now() / 1000) - RECENT_WINDOW_SECS;
 }
 
 function fmtCmd(cmd) {
@@ -129,7 +132,7 @@ async function render() {
     tr.innerHTML = `
       <td>${escapeHtml(j.id)}</td>
       <td><span class="status ${escapeHtml(j.status)}">${escapeHtml(j.status)}</span></td>
-      <td>${fmtDuration(end - j.started_at - pausedSecs(j))}</td>
+      <td>${j.started_at == null ? '-' : fmtDuration(end - j.started_at - pausedSecs(j))}</td>
       <td class="cmd">${escapeHtml(fmtCmd(j.cmd))}</td>
       <td class="cmd">${escapeHtml(j.cwd || '')}</td>
       <td>${isActive(j) ? `<button data-stop="${escapeHtml(j.id)}">Stop</button>` : ''}</td>

@@ -39,9 +39,11 @@ JOBS_DIR = os.path.join(STATE_DIR, "jobs")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 STOP_GRACE_SECS = 10
-# Statuses a job can still be signalled in. "paused" belongs here: a SIGSTOPped job is frozen,
-# not finished, so nothing may treat it as terminal.
-ACTIVE_STATUSES = ("running", "stopping", "paused")
+# Statuses a job is not finished in. "paused" belongs here: a SIGSTOPped job is frozen, not
+# finished, so nothing may treat it as terminal. "queued" belongs here for the mirror-image
+# reason: a job waiting on `--after` has not started yet, so nothing may treat it as finished
+# either — but unlike the others it has no process, so it can be signalled only by the daemon.
+ACTIVE_STATUSES = ("running", "stopping", "paused", "queued")
 # How long submit_job waits for the supervisor to confirm the command started. Generous: it
 # only has to cover interpreter startup on a loaded machine, and is never reached in practice.
 SUBMIT_CONFIRM_SECS = 10
@@ -93,6 +95,11 @@ def apply_meta_defaults(meta):
         # parked overnight does not report the parking as work.
         "paused_at": None,
         "paused_secs": 0.0,
+        # Deferred start: "after" is the job this one waits on (None if it waits on nothing),
+        # "queued_at" when it was submitted. A queued job has no pid and no started_at — the
+        # watcher fills started_at in at the moment it actually spawns the command.
+        "after": None,
+        "queued_at": None,
     }
     for key, value in defaults.items():
         meta.setdefault(key, value)
@@ -218,7 +225,19 @@ def supervise(job_id, status_fd=None):
     return 0
 
 
-def submit_job(name, cmd, cwd, env_overrides):
+def submit_job(name, cmd, cwd, env_overrides, after=None):
+    """Create a job record and start it, or — with `after` — queue it for the watcher to start.
+
+    Queueing is a record with no process: status "queued", no pid, and no started_at until the
+    watcher actually spawns the command, so a job's runtime never counts the time it spent
+    waiting. The dependency is only checked for existence; it may itself still be queued, which
+    is what lets a chain of jobs be submitted in one go.
+    """
+    if after and not os.path.isdir(job_dir(after)):
+        # Raised before anything is created, so a submit naming a job that does not exist
+        # leaves no half-formed record behind — it becomes do_POST's 400 and nothing else.
+        raise ValueError(f"unknown job {after}")
+
     job_id = f"{name}-{uuid.uuid4().hex[:8]}" if name else uuid.uuid4().hex[:12]
     d = job_dir(job_id)
     os.makedirs(d, exist_ok=True)
@@ -229,12 +248,31 @@ def submit_job(name, cmd, cwd, env_overrides):
         "cmd": cmd,
         "cwd": cwd,
         "env": env_overrides or {},  # applied by the supervisor on top of its inherited env
-        "started_at": time.time(),
+        "started_at": None if after else time.time(),
+        "status": "queued" if after else "running",
+        "after": after,
+        "queued_at": time.time() if after else None,
     })
     write_meta(job_id, meta)
     # Touch the log so reads never 404 in the moment before the supervisor opens it. The
     # supervisor writes it; the daemon keeps no handle on it.
     open(os.path.join(d, "log"), "ab").close()
+
+    if after:
+        return job_id
+    return start_job(job_id)
+
+
+def start_job(job_id):
+    """Spawn the supervisor for an existing job record and confirm the command really started.
+
+    Split out of submit_job so that a job the watcher releases from the queue goes through
+    exactly the same spawn, the same confirmation and the same failure handling as one started
+    at submit time. The record already exists; this adds the supervisor's pid to it, or — when
+    no supervisor could be started at all — records the job terminal and re-raises.
+    """
+    meta = read_meta(job_id)
+    d = job_dir(job_id)
 
     # The exec now happens in the supervisor, one process further away, so the daemon's own
     # Popen succeeding no longer proves the command ran. This pipe carries that news back:
@@ -312,7 +350,9 @@ def reconcile_job(job_id):
     every job every 2 seconds, and must not continuously rewrite quiescent metadata.
     """
     meta = read_meta(job_id)
-    if meta["status"] not in ACTIVE_STATUSES:
+    # A queued job is active but has no process at all, so there is no liveness to check and
+    # no supervisor record to fold in; start_queued_jobs is the only thing that moves it on.
+    if meta["status"] == "queued" or meta["status"] not in ACTIVE_STATUSES:
         return meta
 
     # Liveness first, supervisor.json second. A dead supervisor can never write again, so a
@@ -409,6 +449,13 @@ def stop_job(job_id):
     meta = read_meta(job_id)
     if meta["status"] not in ACTIVE_STATUSES:
         return meta
+    if meta["status"] == "queued":
+        # Nothing was ever spawned, so there is nothing to signal: the record going terminal
+        # here is also what keeps the watcher from ever starting it.
+        meta["status"] = "stopped"
+        meta["ended_at"] = time.time()
+        write_meta(job_id, meta)
+        return meta
     pid = meta["pid"]
     if pid and pid_alive(pid):
         if meta["status"] == "paused":
@@ -454,8 +501,46 @@ def stop_job(job_id):
     return meta
 
 
+def start_queued_jobs():
+    """Start every queued job whose dependency has left the active statuses.
+
+    The dependency's exit code is deliberately irrelevant: `--after` chains work, it does not
+    express success, and a job queued behind a run that fails still has to get its turn — the
+    alternative silently strands it forever with nothing to say so. A dependency whose record
+    has been deleted counts as finished for the same reason.
+    """
+    for job_id in list_job_ids():
+        try:
+            meta = read_meta(job_id)
+            if meta["status"] != "queued":
+                continue
+            after = meta["after"]
+            if after and os.path.isdir(job_dir(after)) \
+                    and reconcile_job(after)["status"] in ACTIVE_STATUSES:
+                continue
+            # started_at is written before the spawn, not after: it is what every reader uses
+            # to tell a job that has begun from one still waiting.
+            meta["started_at"] = time.time()
+            meta["status"] = "running"
+            write_meta(job_id, meta)
+            try:
+                start_job(job_id)
+            except Exception as exc:
+                # No submit call is listening this time, so the error goes where the caller
+                # will look for it instead. The record reaches a terminal state without help
+                # from here — a supervisor that could not be spawned is recorded exited by
+                # start_job itself, and a command that could not be exec'd has its 127 in
+                # supervisor.json, folded in by the reconcile pass in this same tick — so all
+                # that would otherwise be lost is the reason.
+                with open(os.path.join(job_dir(job_id), "log"), "ab", buffering=0) as logf:
+                    logf.write(f"jobctl: deferred start failed: {exc}\n".encode())
+        except Exception:
+            pass
+
+
 def watcher_loop():
     while True:
+        start_queued_jobs()
         for job_id in list_job_ids():
             try:
                 reconcile_job(job_id)
@@ -506,7 +591,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/jobs":
             jobs = [reconcile_job(j) for j in list_job_ids()]
-            jobs.sort(key=lambda m: m["started_at"], reverse=True)
+            # A queued job has no started_at yet, so it sorts by when it was queued.
+            jobs.sort(key=lambda m: m["started_at"] or m["queued_at"] or 0, reverse=True)
             return self._json(200, jobs)
 
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs":
@@ -557,7 +643,8 @@ class Handler(BaseHTTPRequestHandler):
                 name = payload.get("name", "")
                 cwd = payload.get("cwd") or os.getcwd()
                 env_overrides = payload.get("env") or {}
-                job_id = submit_job(name, cmd, cwd, env_overrides)
+                after = payload.get("after") or None
+                job_id = submit_job(name, cmd, cwd, env_overrides, after)
                 return self._json(200, {"id": job_id})
             except Exception as e:
                 return self._json(400, {"error": str(e)})

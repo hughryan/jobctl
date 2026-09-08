@@ -2,7 +2,7 @@
 """CLI for jobd, the local long-running-job daemon. Works with any shell command.
 
 Usage:
-  jobctl submit [--name NAME] [--cwd DIR] -- <command> [args...]
+  jobctl submit [--name NAME] [--cwd DIR] [--after ID] -- <command> [args...]
   jobctl list [--all | --since DURATION]
   jobctl status <id>
   jobctl logs <id> [--tail N] [--follow]
@@ -44,8 +44,10 @@ LIST_DEFAULT_WINDOW_SECS = 86400
 DEFAULT_MAX_WAIT_SECS = 2700.0
 # "paused" is active: a SIGSTOPped job is frozen, not finished, so `list` keeps showing it,
 # `wait` keeps blocking on it, `logs --follow` keeps following it, and `daemon restart` warns
-# about it exactly as it would for a running one.
-ACTIVE_STATUSES = ("running", "stopping", "paused")
+# about it exactly as it would for a running one. "queued" is active for the same reason read
+# from the other end: a job waiting on `--after` has not started, so nothing may read it as
+# finished — a `wait` that returned on one would report work that has not happened yet.
+ACTIVE_STATUSES = ("running", "stopping", "paused", "queued")
 # How long `daemon stop`/`daemon restart` waits for a SIGTERMed daemon to exit before
 # escalating to SIGKILL. The daemon has nothing to flush on the way out - jobs and their
 # logs belong to the supervisors - so a few seconds is generous.
@@ -168,7 +170,7 @@ def cmd_submit(args):
     if not command:
         print("error: no command given after --", file=sys.stderr)
         sys.exit(2)
-    name, cwd, env = "", None, {}
+    name, cwd, env, after = "", None, {}, None
     i = 0
     while i < len(opts):
         if opts[i] == "--name":
@@ -176,6 +178,9 @@ def cmd_submit(args):
             i += 2
         elif opts[i] == "--cwd":
             cwd = submit_opt_value(opts, i)
+            i += 2
+        elif opts[i] == "--after":
+            after = submit_opt_value(opts, i)
             i += 2
         elif opts[i] == "--env":
             # Split on the first `=` only, so a value may itself contain `=`. An empty value
@@ -192,7 +197,8 @@ def cmd_submit(args):
             print(f"error: unknown option {opts[i]}", file=sys.stderr)
             sys.exit(2)
     result = request("POST", "/api/jobs",
-                     {"name": name, "cmd": command, "cwd": cwd or os.getcwd(), "env": env})
+                     {"name": name, "cmd": command, "cwd": cwd or os.getcwd(), "env": env,
+                      "after": after})
     print(result["id"])
 
 
@@ -258,7 +264,8 @@ def cmd_list(args):
         return
     cutoff = None if window is None else time.time() - window
     shown = [j for j in jobs
-             if j["status"] in ACTIVE_STATUSES or cutoff is None or j["started_at"] >= cutoff]
+             if j["status"] in ACTIVE_STATUSES or cutoff is None
+             or (j["started_at"] or j.get("queued_at") or 0) >= cutoff]
     hidden = len(jobs) - len(shown)
 
     if not shown:
@@ -270,10 +277,15 @@ def cmd_list(args):
         id_w = max(12, max(len(j["id"]) for j in shown))
         print(f"{'ID':<{id_w}} {'STATUS':<8} {'RUNTIME':<8} CMD")
         for j in shown:
-            end = j["ended_at"] or time.time()
-            # Paused time is not runtime: a job parked overnight to free the GPU must not read
-            # in the morning as having worked for eight hours.
-            runtime = fmt_duration(end - j["started_at"] - paused_secs(j))
+            # A queued job has not started, so it has no runtime to report — not "0s", which
+            # would read as a job that started and did nothing.
+            if j["started_at"] is None:
+                runtime = "-"
+            else:
+                end = j["ended_at"] or time.time()
+                # Paused time is not runtime: a job parked overnight to free the GPU must not
+                # read in the morning as having worked for eight hours.
+                runtime = fmt_duration(end - j["started_at"] - paused_secs(j))
             cmd_str = " ".join(" ".join(j["cmd"]).split())
             if len(cmd_str) > 80:
                 cmd_str = cmd_str[:80] + "…"
@@ -526,8 +538,8 @@ def daemon_uptime_secs(pid):
 
 
 def active_jobs():
-    """Jobs the daemon currently considers active — running, stopping or paused; [] if it
-    cannot be asked."""
+    """Jobs the daemon currently considers active — running, stopping, paused or queued; []
+    if it cannot be asked."""
     try:
         jobs = request("GET", "/api/jobs")
     except (urllib.error.URLError, OSError):
@@ -592,8 +604,10 @@ def daemon_status():
     jobs = active_jobs()
     running = sum(1 for j in jobs if j["status"] == "running")
     paused = sum(1 for j in jobs if j["status"] == "paused")
-    stopping = len(jobs) - running - paused
+    queued = sum(1 for j in jobs if j["status"] == "queued")
+    stopping = len(jobs) - running - paused - queued
     field("jobs", f"{running} running"
+                  + (f", {queued} queued" if queued else "")
                   + (f", {paused} paused" if paused else "")
                   + (f", {stopping} stopping" if stopping else ""))
 

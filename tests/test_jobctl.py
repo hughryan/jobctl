@@ -520,6 +520,90 @@ class TestInvariants(DaemonHarness, unittest.TestCase):
         self.assertLess(runtime, elapsed - 1.4,
                         f"runtime {runtime}s counted the pause; {elapsed:.1f}s have elapsed")
 
+    # --- invariant: a queued job is active, has no process, and starts on its dependency ---
+
+    def test_after_starts_when_the_dependency_ends(self):
+        """A `--after` job waits as a first-class record, then runs once the dependency ends."""
+        first = self.submit("--", "sleep", "2", name="afterdep")
+        second = self.submit("--after", first, "--", "sh", "-c", "echo started", name="afterjob")
+
+        queued = self.job_meta(second)
+        self.assertEqual(queued["status"], "queued")
+        self.assertIsNone(queued["started_at"], "a queued job must not carry a start time")
+        self.assertIsNone(queued["pid"], "a queued job must not carry a pid")
+        self.assertEqual(queued["after"], first)
+        self.assertEqual(self.list_row(second)[1:3], ["queued", "-"],
+                         "`list` rendered a runtime for a job that has not started")
+
+        rc, out, err = run_cli(self.env, "wait", first, "--timeout", "30", "--poll", "0.2")
+        self.assertEqual(rc, 0, f"the dependency never finished: {out} {err}")
+        dependency = json.loads(out)
+
+        rc, out, err = run_cli(self.env, "wait", second, "--timeout", "8", "--poll", "0.2")
+        self.assertEqual(rc, 0, f"the queued job never started: {out} {err}")
+        meta = json.loads(out)
+        self.assertEqual(meta["status"], "exited")
+        self.assertEqual(meta["exit_code"], 0)
+        self.assertIn("started", self.job_log(second), "the queued job never ran its command")
+        self.assertGreaterEqual(meta["started_at"], dependency["ended_at"],
+                                "the queued job started before its dependency ended")
+
+    def test_after_starts_regardless_of_the_dependency_exit_code(self):
+        """`--after` chains work, not success: a failed dependency still releases the queue."""
+        first = self.submit("--", "sh", "-c", "exit 3", name="afterfaildep")
+        second = self.submit("--after", first, "--", "true", name="afterfailjob")
+
+        rc, out, err = run_cli(self.env, "wait", first, "--timeout", "30", "--poll", "0.2")
+        self.assertEqual(rc, 0, f"the dependency never finished: {out} {err}")
+        self.assertEqual(json.loads(out)["exit_code"], 3)
+
+        rc, out, err = run_cli(self.env, "wait", second, "--timeout", "8", "--poll", "0.2")
+        self.assertEqual(rc, 0, f"a job queued behind a failure never started: {out} {err}")
+        meta = json.loads(out)
+        self.assertEqual(meta["status"], "exited")
+        self.assertEqual(meta["exit_code"], 0)
+
+    def test_stop_on_a_queued_job_never_starts_it(self):
+        """Stopping a queued job is a record change, and the watcher must never undo it."""
+        first = self.submit("--", "sleep", "30", name="queuedstopdep")
+        self.addCleanup(self.stop_and_reap, first)
+        second = self.submit("--after", first, "--", "sh", "-c", "echo started",
+                             name="queuedstopjob")
+
+        rc, out, err = run_cli(self.env, "stop", second)
+        self.assertEqual(rc, 0, f"stop failed: {out} {err}")
+        meta = json.loads(out)
+        self.assertEqual(meta["status"], "stopped")
+        self.assertIsNone(meta["pid"], "stopping a queued job spawned something to signal")
+        self.assertEqual(self.job_log(second).strip(), "")
+
+        self.stop_and_reap(first)
+        time.sleep(3)  # more than one watcher tick past the dependency going terminal
+        self.assertEqual(self.job_meta(second)["status"], "stopped",
+                         "the watcher started a job that had already been stopped")
+        self.assertEqual(self.job_log(second).strip(), "")
+
+    def test_after_rejects_an_unknown_job(self):
+        """A dependency that does not exist is an error at submit, and leaves no record."""
+        jobs_dir = os.path.join(self.state_dir, "jobs")
+        before = sorted(os.listdir(jobs_dir))
+        rc, out, err = run_cli(self.env, "submit", "--after", "nope", "--", "true")
+        self.assertEqual(rc, 1, f"submitting after an unknown job succeeded: {out} {err}")
+        self.assertIn("nope", err, "the error did not name the job that was not found")
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(sorted(os.listdir(jobs_dir)), before,
+                         "a rejected submit left a job record behind")
+
+    def test_wait_blocks_on_a_queued_job(self):
+        """Queued is not terminal: `wait` must time out on it exactly as on a running job."""
+        first = self.submit("--", "sleep", "30", name="queuedwaitdep")
+        self.addCleanup(self.stop_and_reap, first)
+        second = self.submit("--after", first, "--", "true", name="queuedwaitjob")
+        self.addCleanup(self.stop_and_reap, second)
+        rc, out, err = run_cli(self.env, "wait", second, "--timeout", "1", "--poll", "0.2")
+        self.assertEqual(rc, 1, f"wait treated a queued job as terminal: {out} {err}")
+        self.assertEqual(json.loads(out)["status"], "queued")
+
     # --- invariant: everything after `--` reaches the job verbatim -------------------
 
     def test_everything_after_double_dash_reaches_the_job_verbatim(self):
@@ -561,8 +645,10 @@ class TestInvariants(DaemonHarness, unittest.TestCase):
         for args, needle in [
             (["submit", "--name", "--", "true"], "--name expects a value"),
             (["submit", "--cwd", "--", "true"], "--cwd expects a value"),
+            (["submit", "--after", "--", "true"], "--after expects a value"),
             (["submit", "--name", "", "--", "true"], "--name expects a value"),
             (["submit", "--cwd", "", "--", "true"], "--cwd expects a value"),
+            (["submit", "--after", "", "--", "true"], "--after expects a value"),
         ]:
             with self.subTest(args=args):
                 self.assertRejected(args, needle)
