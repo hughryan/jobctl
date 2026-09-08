@@ -199,6 +199,8 @@ The CLI is a thin client over this; use it directly if you want to build somethi
 | `GET` | `/api/jobs/<id>` | One job's full metadata. |
 | `GET` | `/api/jobs/<id>/log?tail=N` | Last `N` lines of combined output (default 200). |
 | `POST` | `/api/jobs/<id>/stop` | `SIGTERM` the process group, `SIGKILL` after 10s. |
+| `POST` | `/api/jobs/<id>/pause` | `SIGSTOP` the process group. 409 if the job is not running. |
+| `POST` | `/api/jobs/<id>/resume` | `SIGCONT` the process group. 409 if the job is not paused. |
 
 Note that `cmd` is a **list**, not a string. It is passed to `subprocess.Popen` as structured data
 and never handed to a shell, so there is no quoting or word-splitting layer to get wrong.
@@ -301,6 +303,8 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 | `jobctl status <id>` | Full JSON for one job: status, pid, exit code, timestamps, cwd, command. |
 | `jobctl logs <id> [--tail N] [--follow]` | Print combined stdout+stderr. `--tail` defaults to 200; `--follow` prints those last lines, then streams new output until the job ends (exit 0) or `JOBCTL_MAX_WAIT` elapses (exit 1 — resume with `--follow --tail 0`). |
 | `jobctl stop <id>` | `SIGTERM` the job's process group, escalating to `SIGKILL` after 10 seconds. |
+| `jobctl pause <id>` | `SIGSTOP` the job's process group: it stops computing instantly and keeps everything it holds, including GPU memory. Fails (exit 1) if the job is not running. |
+| `jobctl resume <id>` | `SIGCONT` a paused job's process group, picking up exactly where it froze. Fails (exit 1) if the job is not paused. |
 | `jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]` | Block until terminal state or timeout. Defaults: 540s timeout, 2s poll; a longer `--timeout` is clamped to `JOBCTL_MAX_WAIT` (45 minutes). Exit 0 = done, exit 1 = timed out. |
 | `jobctl ui` | Print the dashboard URL. |
 | `jobctl daemon status` | Report on the daemon itself: pid, port, state directory, uptime, the `jobd.py` it is running from, and how many jobs are active. Exits 0 whether or not one is running. |
@@ -308,8 +312,12 @@ forwarded to the remote `jobctl`, which would otherwise silently apply its own d
 | `jobctl daemon stop` | Stop the daemon. Jobs keep running. Stopping an already-stopped daemon is a success. |
 | `jobctl --host <ssh-alias> <any of the above>` | Run that command on a remote machine over SSH. |
 
-Job statuses are `running`, `stopping`, `exited` (the process finished on its own — check
-`exit_code`), and `stopped` (it was terminated by `jobctl stop`).
+Job statuses are `running`, `paused` (frozen by `jobctl pause`, holding its memory but using no
+CPU or GPU), `stopping`, `exited` (the process finished on its own — check `exit_code`), and
+`stopped` (it was terminated by `jobctl stop`). A paused job counts as active everywhere a running
+one does — `list` keeps showing it, `wait` keeps blocking on it — and the time it spends paused is
+subtracted from the runtime column, so parking a job overnight does not read as eight hours of work
+in the morning.
 
 The `--` before the command is required. Everything after it is the command and its arguments, taken
 verbatim; everything before it belongs to `jobctl`. This is what lets a job take flags of its own

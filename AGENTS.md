@@ -74,6 +74,29 @@ well-intentioned refactor breaks.
   into a shell, which both `README.md` and the agent skill instruct people to use — and it
   fails without an error, so the loop simply appears to have worked. No subcommand ever needs
   local stdin: the job's own stdin is `DEVNULL`, set by the supervisor.
+- **A pause SIGSTOPs the whole process group, supervisor included, and `paused` is not a
+  terminal state.** `SIGSTOP` can be neither caught nor ignored, so `jobctl pause` freezes the
+  supervisor mid-`proc.wait()` along with the job. That is by design and harmless: nothing is
+  waiting on the supervisor, and its `wait` resumes on `SIGCONT` with the job's exit code still
+  recorded by the one process guaranteed to outlive it. Liveness is unaffected, because nothing
+  here reaps with `WUNTRACED` — `Popen.poll()` and `os.kill(pid, 0)` both read a stopped process
+  as alive, which is why a paused job is not misreported as dead. `paused` therefore belongs in
+  `ACTIVE_STATUSES` in all three places that define it (`jobd.py`, `jobctl`, `static/index.html`):
+  a frozen job must never read as finished to `wait`, `list`, `logs --follow`, `daemon restart`
+  or the dashboard.
+- **`stop_job` must `SIGCONT` a paused job before it `SIGTERM`s it.** A stopped process acts on
+  nothing: the `SIGTERM` stays pending until something continues it, so the whole 10-second grace
+  period would elapse with the job still frozen and every stop of a paused job would escalate to
+  `SIGKILL` — losing the recorded exit code that the graceful path exists to preserve. Removing
+  the `SIGCONT` still passes any test that only asserts the job eventually goes terminal; the test
+  asserts the exit code is `-15` and that it arrives inside the grace window, which is what makes
+  the difference visible.
+- **Runtime excludes paused intervals.** `paused_secs` accumulates closed intervals and
+  `paused_at` holds an open one; both are subtracted wherever runtime is rendered (`jobctl list`
+  and the dashboard), and an open interval is closed by `resume_job`, by `stop_job`, and by
+  `reconcile_job` when a job dies while paused. Without that last one a job killed while frozen
+  would count the frozen time as work forever. Runtime is meant to answer "how long has this job
+  been working", so a run parked overnight to free the GPU must not report the parking.
 - **Exit codes are a contract.** `jobctl wait` exits `0` on terminal state and `1` on timeout;
   the documented `while ! jobctl wait ...; do :; done` loop depends on it, and `--host`
   propagates the remote code verbatim. Do not remap or swallow exit codes.

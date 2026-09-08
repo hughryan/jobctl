@@ -30,6 +30,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +111,19 @@ def run_cli(env, *args, timeout=60, cwd=REPO_ROOT):
                           env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=timeout)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def parse_runtime(text):
+    """Seconds from what fmt_duration prints — "45s", "2m5s", "1h3m"."""
+    units = {"h": 3600, "m": 60, "s": 1}
+    total, digits = 0, ""
+    for ch in text:
+        if ch.isdigit():
+            digits += ch
+        else:
+            total += int(digits) * units[ch]
+            digits = ""
+    return total
 
 
 def write_fake_ssh(directory):
@@ -376,6 +390,135 @@ class TestInvariants(DaemonHarness, unittest.TestCase):
         """Stop a job and block until it is terminal, so no supervisor outlives the suite."""
         run_cli(self.env, "stop", job_id, timeout=30)
         run_cli(self.env, "wait", job_id, "--timeout", "30", "--poll", "0.2", timeout=45)
+
+    # --- invariant: a pause freezes the whole group, and paused is not terminal -------
+
+    def ticker(self, name):
+        """Submit a job that appends a line to a file every 0.1s; return (job_id, path).
+
+        A file the job writes, rather than its own log, because file size is a direct
+        measure of whether the process is executing at all — which is the only question
+        SIGSTOP raises. The path is passed as an argument, not interpolated into the
+        script, so a temp path can never be re-read as shell syntax.
+        """
+        tick_dir = tempfile.mkdtemp(prefix="jobctl-tick-")
+        self.addCleanup(shutil.rmtree, tick_dir, ignore_errors=True)
+        path = os.path.join(tick_dir, "ticks")
+        job_id = self.submit("--", "sh", "-c", 'while true; do echo tick >> "$1"; sleep 0.1; done',
+                             "ticker", path, name=name)
+        self.addCleanup(self.stop_and_reap, job_id)
+        return job_id, path
+
+    def tick_size(self, path):
+        return os.path.getsize(path) if os.path.exists(path) else 0
+
+    def wait_for_ticks(self, path, since=0, timeout=15):
+        """Block until the tick file has grown past `since`, and return its new size."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            size = self.tick_size(path)
+            if size > since:
+                return size
+            time.sleep(0.05)
+        self.fail(f"the job wrote nothing past {since} bytes within {timeout}s")
+
+    def job_meta(self, job_id):
+        rc, out, err = run_cli(self.env, "status", job_id)
+        self.assertEqual(rc, 0, err)
+        return json.loads(out)
+
+    def list_row(self, job_id):
+        """The `jobctl list` row for a job, as fields: [id, status, runtime, *cmd]."""
+        rc, out, err = run_cli(self.env, "list")
+        self.assertEqual(rc, 0, err)
+        for line in out.splitlines():
+            fields = line.split()
+            if fields[:1] == [job_id]:
+                return fields
+        self.fail(f"{job_id} is missing from `jobctl list`:\n{out}")
+
+    def pause(self, job_id):
+        rc, out, err = run_cli(self.env, "pause", job_id)
+        self.assertEqual(rc, 0, f"pause failed: {out} {err}")
+        self.assertEqual(json.loads(out)["status"], "paused")
+
+    def test_pause_freezes_the_job_and_resume_thaws_it(self):
+        """SIGSTOP the group and it stops computing; SIGCONT and it picks up where it was."""
+        job_id, path = self.ticker("pause")
+        self.wait_for_ticks(path)
+        self.pause(job_id)
+        self.assertEqual(self.job_meta(job_id)["status"], "paused")
+        time.sleep(0.2)  # let the signal land before sampling what "frozen" means
+        frozen = self.tick_size(path)
+        time.sleep(0.7)  # seven ticks' worth, had anything in the group still been running
+        self.assertEqual(self.tick_size(path), frozen, "a paused job kept running")
+
+        rc, out, err = run_cli(self.env, "resume", job_id)
+        self.assertEqual(rc, 0, f"resume failed: {out} {err}")
+        self.assertEqual(json.loads(out)["status"], "running")
+        self.wait_for_ticks(path, since=frozen, timeout=5)
+
+    def test_wait_keeps_blocking_on_a_paused_job(self):
+        """A pause is not an ending: paused is an active status, so `wait` must time out."""
+        job_id, path = self.ticker("pausewait")
+        self.wait_for_ticks(path)
+        self.pause(job_id)
+        rc, out, err = run_cli(self.env, "wait", job_id, "--timeout", "1", "--poll", "0.2")
+        self.assertEqual(rc, 1, f"wait treated a paused job as terminal: {out} {err}")
+        self.assertEqual(json.loads(out)["status"], "paused")
+
+    def test_stop_terminates_a_paused_job(self):
+        """Without a SIGCONT first the SIGTERM only sits pending, and stop escalates to -9."""
+        job_id, path = self.ticker("pausestop")
+        self.wait_for_ticks(path)
+        self.pause(job_id)
+        rc, out, err = run_cli(self.env, "stop", job_id)
+        self.assertEqual(rc, 0, f"stop failed: {out} {err}")
+
+        started = time.time()
+        rc, out, err = run_cli(self.env, "wait", job_id, "--timeout", "30", "--poll", "0.2")
+        self.assertEqual(rc, 0, f"a stopped-while-paused job never went terminal: {out} {err}")
+        meta = json.loads(out)
+        self.assertEqual(meta["status"], "stopped")
+        self.assertEqual(meta["exit_code"], -signal.SIGTERM,
+                         "the SIGTERM did not reach the frozen job; stop escalated instead")
+        self.assertLess(time.time() - started, 8,
+                        "the job died only after the 10s SIGKILL escalation")
+
+    def test_pause_rejects_a_job_that_is_not_running(self):
+        job_id = self.submit("--", "true", name="pausefinished")
+        rc, out, err = run_cli(self.env, "wait", job_id, "--timeout", "30", "--poll", "0.2")
+        self.assertEqual(rc, 0, err)
+        rc, out, err = run_cli(self.env, "pause", job_id)
+        self.assertEqual(rc, 1, f"pausing a finished job succeeded: {out}")
+        self.assertIn("exited", err, "the refusal did not name the job's actual state")
+        self.assertNotIn("Traceback", err)
+
+    def test_resume_rejects_a_job_that_is_not_paused(self):
+        job_id = self.submit("--", "sleep", "30", name="resumerunning")
+        self.addCleanup(self.stop_and_reap, job_id)
+        rc, out, err = run_cli(self.env, "resume", job_id)
+        self.assertEqual(rc, 1, f"resuming a running job succeeded: {out}")
+        self.assertIn("running", err, "the refusal did not name the job's actual state")
+        self.assertNotIn("Traceback", err)
+
+    # --- invariant: runtime excludes paused intervals ---------------------------------
+
+    def test_runtime_excludes_time_spent_paused(self):
+        job_id, path = self.ticker("pausedruntime")
+        self.wait_for_ticks(path)
+        self.pause(job_id)
+        time.sleep(1.5)
+        rc, out, err = run_cli(self.env, "resume", job_id)
+        self.assertEqual(rc, 0, f"resume failed: {out} {err}")
+
+        meta = self.job_meta(job_id)
+        self.assertGreaterEqual(meta["paused_secs"], 1.4)
+        self.assertIsNone(meta["paused_at"], "the resumed interval was left open")
+        elapsed = time.time() - meta["started_at"]
+        runtime = parse_runtime(self.list_row(job_id)[2])
+        self.assertLess(runtime, elapsed - 1.4,
+                        f"runtime {runtime}s counted the pause; {elapsed:.1f}s have elapsed")
 
     # --- invariant: everything after `--` reaches the job verbatim -------------------
 
