@@ -7,6 +7,8 @@ Usage:
   jobctl status <id>
   jobctl logs <id> [--tail N] [--follow]
   jobctl stop <id>
+  jobctl pause <id>
+  jobctl resume <id>
   jobctl wait <id> [--timeout SECONDS] [--poll SECONDS]
   jobctl ui
   jobctl daemon <status|restart|stop>
@@ -40,7 +42,10 @@ LIST_DEFAULT_WINDOW_SECS = 86400
 # session's cached context. 45 minutes leaves margin for the tool return and the model turn
 # that follow the block.
 DEFAULT_MAX_WAIT_SECS = 2700.0
-ACTIVE_STATUSES = ("running", "stopping")
+# "paused" is active: a SIGSTOPped job is frozen, not finished, so `list` keeps showing it,
+# `wait` keeps blocking on it, `logs --follow` keeps following it, and `daemon restart` warns
+# about it exactly as it would for a running one.
+ACTIVE_STATUSES = ("running", "stopping", "paused")
 # How long `daemon stop`/`daemon restart` waits for a SIGTERMed daemon to exit before
 # escalating to SIGKILL. The daemon has nothing to flush on the way out - jobs and their
 # logs belong to the supervisors - so a few seconds is generous.
@@ -125,6 +130,18 @@ def fmt_duration(secs):
     if m:
         return f"{m}m{s}s"
     return f"{s}s"
+
+
+def paused_secs(job):
+    """Seconds a job has spent paused, including an interval still open right now.
+
+    Read defensively, like every other field the CLI takes off a job record: `daemon restart`
+    exists to replace a daemon older than the CLI invoking it, so a record answered by one that
+    predates pausing carries neither key and must still render.
+    """
+    total = job.get("paused_secs") or 0.0
+    open_since = job.get("paused_at")
+    return total + (time.time() - open_since if open_since else 0.0)
 
 
 def submit_opt_value(opts, i):
@@ -254,7 +271,9 @@ def cmd_list(args):
         print(f"{'ID':<{id_w}} {'STATUS':<8} {'RUNTIME':<8} CMD")
         for j in shown:
             end = j["ended_at"] or time.time()
-            runtime = fmt_duration(end - j["started_at"])
+            # Paused time is not runtime: a job parked overnight to free the GPU must not read
+            # in the morning as having worked for eight hours.
+            runtime = fmt_duration(end - j["started_at"] - paused_secs(j))
             cmd_str = " ".join(" ".join(j["cmd"]).split())
             if len(cmd_str) > 80:
                 cmd_str = cmd_str[:80] + "…"
@@ -335,6 +354,22 @@ def cmd_stop(args):
     print(json.dumps(meta, indent=2))
 
 
+def cmd_pause(args):
+    if not args:
+        print("error: usage: jobctl pause <id>", file=sys.stderr)
+        sys.exit(2)
+    meta = request("POST", f"/api/jobs/{args[0]}/pause")
+    print(json.dumps(meta, indent=2))
+
+
+def cmd_resume(args):
+    if not args:
+        print("error: usage: jobctl resume <id>", file=sys.stderr)
+        sys.exit(2)
+    meta = request("POST", f"/api/jobs/{args[0]}/resume")
+    print(json.dumps(meta, indent=2))
+
+
 def cmd_wait(args):
     """Block in this single process until the job reaches a terminal state or the
     timeout elapses, instead of the caller re-invoking a tool call every poll tick.
@@ -372,7 +407,7 @@ def cmd_wait(args):
     deadline = time.time() + timeout
     while True:
         meta = request("GET", f"/api/jobs/{job_id}")
-        if meta["status"] not in ("running", "stopping"):
+        if meta["status"] not in ACTIVE_STATUSES:
             print(json.dumps(meta, indent=2))
             sys.exit(0)
         remaining = deadline - time.time()
@@ -491,7 +526,8 @@ def daemon_uptime_secs(pid):
 
 
 def active_jobs():
-    """Jobs the daemon currently considers running or stopping; [] if it cannot be asked."""
+    """Jobs the daemon currently considers active — running, stopping or paused; [] if it
+    cannot be asked."""
     try:
         jobs = request("GET", "/api/jobs")
     except (urllib.error.URLError, OSError):
@@ -555,8 +591,11 @@ def daemon_status():
         print("         at import, so the dashboard will 404 until you run `jobctl daemon restart`.")
     jobs = active_jobs()
     running = sum(1 for j in jobs if j["status"] == "running")
-    stopping = len(jobs) - running
-    field("jobs", f"{running} running" + (f", {stopping} stopping" if stopping else ""))
+    paused = sum(1 for j in jobs if j["status"] == "paused")
+    stopping = len(jobs) - running - paused
+    field("jobs", f"{running} running"
+                  + (f", {paused} paused" if paused else "")
+                  + (f", {stopping} stopping" if stopping else ""))
 
 
 def daemon_gone(pid, port, timeout):
@@ -769,6 +808,8 @@ COMMANDS = {
     "status": cmd_status,
     "logs": cmd_logs,
     "stop": cmd_stop,
+    "pause": cmd_pause,
+    "resume": cmd_resume,
     "wait": cmd_wait,
     "ui": cmd_ui,
     "daemon": cmd_daemon,

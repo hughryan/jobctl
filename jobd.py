@@ -39,6 +39,9 @@ JOBS_DIR = os.path.join(STATE_DIR, "jobs")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = int(os.environ.get("JOBCTL_PORT", "8787"))
 STOP_GRACE_SECS = 10
+# Statuses a job can still be signalled in. "paused" belongs here: a SIGSTOPped job is frozen,
+# not finished, so nothing may treat it as terminal.
+ACTIVE_STATUSES = ("running", "stopping", "paused")
 # How long submit_job waits for the supervisor to confirm the command started. Generous: it
 # only has to cover interpreter startup on a loaded machine, and is never reached in practice.
 SUBMIT_CONFIRM_SECS = 10
@@ -85,6 +88,11 @@ def apply_meta_defaults(meta):
         "env": {},
         "ended_at": None,
         "exit_code": None,
+        # Pause bookkeeping: paused_at is the open interval's start (None when not paused),
+        # paused_secs the total of the closed ones. Runtime is wall clock minus both, so a job
+        # parked overnight does not report the parking as work.
+        "paused_at": None,
+        "paused_secs": 0.0,
     }
     for key, value in defaults.items():
         meta.setdefault(key, value)
@@ -286,6 +294,14 @@ def submit_job(name, cmd, cwd, env_overrides):
         os.close(r)
 
 
+def close_pause_interval(meta):
+    """Fold an open pause interval into paused_secs, in place. No-op if none is open."""
+    if meta.get("paused_at") is None:
+        return
+    meta["paused_secs"] = (meta.get("paused_secs") or 0.0) + (time.time() - meta["paused_at"])
+    meta["paused_at"] = None
+
+
 def reconcile_job(job_id):
     """Compose the supervisor's record into meta.json, however this daemon finds the job.
 
@@ -296,7 +312,7 @@ def reconcile_job(job_id):
     every job every 2 seconds, and must not continuously rewrite quiescent metadata.
     """
     meta = read_meta(job_id)
-    if meta["status"] not in ("running", "stopping"):
+    if meta["status"] not in ACTIVE_STATUSES:
         return meta
 
     # Liveness first, supervisor.json second. A dead supervisor can never write again, so a
@@ -333,6 +349,9 @@ def reconcile_job(job_id):
             write_meta(job_id, meta)
         return meta
 
+    # A job killed while paused (an external SIGKILL, say) ends with its pause still open;
+    # close it here or its runtime would count the frozen time as work forever.
+    close_pause_interval(meta)
     meta["status"] = "stopped" if meta["status"] == "stopping" else "exited"
     write_meta(job_id, meta)
     with lock:
@@ -340,12 +359,68 @@ def reconcile_job(job_id):
     return meta
 
 
+def pause_job(job_id):
+    """SIGSTOP the job's process group, freezing it without losing any of its memory.
+
+    Returns (meta, error). An error means the transition does not apply to the job's current
+    state, which the handler reports as 409 rather than swallowing: pausing a job that already
+    exited is a mistake worth hearing about, not a silent no-op.
+
+    The signal reaches the supervisor too — SIGSTOP cannot be ignored or handled — so the
+    supervisor freezes mid-`proc.wait()`. That is harmless by design: nothing is waiting on it,
+    and the wait resumes on SIGCONT with the job's exit code still recorded by the one process
+    guaranteed to outlive it.
+    """
+    meta = reconcile_job(job_id)
+    if meta["status"] != "running":
+        return meta, f"cannot pause a job that is {meta['status']}"
+    pid = meta["pid"]
+    if not pid or not pid_alive(pid):
+        return meta, "cannot pause: the job's process group is gone"
+    try:
+        os.killpg(pid, signal.SIGSTOP)
+    except OSError as exc:
+        return meta, f"cannot pause: {exc}"
+    meta["status"] = "paused"
+    meta["paused_at"] = time.time()
+    write_meta(job_id, meta)
+    return meta, None
+
+
+def resume_job(job_id):
+    """SIGCONT a paused job's process group and put the frozen interval on its pause tally."""
+    meta = reconcile_job(job_id)
+    if meta["status"] != "paused":
+        return meta, f"cannot resume a job that is {meta['status']}"
+    pid = meta["pid"]
+    if not pid or not pid_alive(pid):
+        return meta, "cannot resume: the job's process group is gone"
+    try:
+        os.killpg(pid, signal.SIGCONT)
+    except OSError as exc:
+        return meta, f"cannot resume: {exc}"
+    close_pause_interval(meta)
+    meta["status"] = "running"
+    write_meta(job_id, meta)
+    return meta, None
+
+
 def stop_job(job_id):
     meta = read_meta(job_id)
-    if meta["status"] not in ("running", "stopping"):
+    if meta["status"] not in ACTIVE_STATUSES:
         return meta
     pid = meta["pid"]
     if pid and pid_alive(pid):
+        if meta["status"] == "paused":
+            # A stopped process acts on nothing: the SIGTERM below would sit pending until
+            # something continued it, the whole grace period would elapse untouched, and every
+            # stop of a paused job would escalate to SIGKILL. Thaw it first, so it dies the
+            # ordinary way and records the ordinary -15.
+            try:
+                os.killpg(pid, signal.SIGCONT)
+            except OSError:
+                pass
+            close_pause_interval(meta)
         meta["status"] = "stopping"
         write_meta(job_id, meta)
         try:
@@ -487,11 +562,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json(400, {"error": str(e)})
 
-        if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "stop":
-            job_id = parts[2]
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" \
+                and parts[3] in ("stop", "pause", "resume"):
+            job_id, action = parts[2], parts[3]
             if not os.path.isdir(job_dir(job_id)):
                 return self._json(404, {"error": "not found"})
-            return self._json(200, stop_job(job_id))
+            if action == "stop":
+                return self._json(200, stop_job(job_id))
+            meta, error = (pause_job if action == "pause" else resume_job)(job_id)
+            # 409 Conflict, not 400: the request is well formed and the job simply is not in a
+            # state this transition applies to. The CLI turns the body into an error line.
+            return self._json(409, {"error": error}) if error else self._json(200, meta)
 
         return self._json(404, {"error": "not found"})
 
