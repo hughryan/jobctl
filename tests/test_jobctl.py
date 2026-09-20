@@ -351,6 +351,28 @@ class TestInvariants(DaemonHarness, unittest.TestCase):
         self.assertEqual(read_ssh_log(ssh_log), [], "a rejected alias still reached ssh")
         self.assertNoLocalDaemon(state_dir)
 
+    # --- invariant: `log` is `logs`, locally and before it crosses ssh ----------------
+
+    def test_log_is_an_alias_for_logs(self):
+        """`jobctl log` used to print usage on stderr, which a stdout grep reads as silence."""
+        job_id = self.submit("--", "echo", "alias-marker", name="alias")
+        run_cli(self.env, "wait", job_id)
+        rc, out, err = run_cli(self.env, "log", job_id)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("alias-marker", out)
+
+    def test_host_forwards_the_canonical_name_for_an_alias(self):
+        """The remote jobctl may predate the alias, so it must only ever be sent `logs`."""
+        env, state_dir, ssh_log = self.host_env()
+        rc, out, err = run_cli(env, "--host", "fakehost", "log", "somejob")
+        self.assertEqual(rc, 0, err)
+        recorded = read_ssh_log(ssh_log)
+        self.assertEqual(len(recorded), 1)
+        remote_command = recorded[0][-1]
+        self.assertIn(" logs ", remote_command)
+        self.assertNotIn(" log ", remote_command)
+        self.assertNoLocalDaemon(state_dir)
+
     # --- invariant: --host runs `ssh -n` --------------------------------------------
 
     def test_host_passes_dash_n_to_ssh(self):

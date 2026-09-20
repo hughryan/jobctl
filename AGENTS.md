@@ -36,6 +36,11 @@ well-intentioned refactor breaks.
   None` (not truthiness, so an empty alias cannot slip past), and an empty alias is rejected
   outright so `--host "$UNSET_VAR"` fails loudly. Both branches return, making local execution
   structurally unreachable once a host is given. Preserve all of this.
+- **Aliases are resolved before dispatch, local or remote.** `ALIASES` (`log` → `logs`) is
+  applied to `argv[0]` in `main()` ahead of the `--host` branch, so the remote jobctl — which may
+  be an older version — only ever receives the canonical subcommand. A misspelt subcommand prints
+  usage on stderr and nothing on stdout, which a monitor grepping stdout reads as "no output
+  yet"; an alias exists only where that slip has actually happened.
 - **`cmd` is a list passed to `subprocess.Popen`, never a shell string.** There is no shell
   between `jobctl` and the job, so there is no quoting or word-splitting layer to get wrong.
   Joining it into a string would introduce an injection and quoting surface that does not
